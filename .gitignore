@@ -1,0 +1,16 @@
+# Distributiepakketten horen bij GitHub Releases, niet in de repo.
+# Bouw ze uit een tag; zie README.md.
+*.zip
+
+# Interne ontwikkelnotities. Bevatten klantspecifieke agenda-URL's en
+# accountpaden, dus bewust buiten de repo: zo kan deze publiek worden
+# zonder de geschiedenis te moeten herschrijven.
+modern-caldav-calendar-memory.md
+
+# Oude versies staan nu in de git-geschiedenis (tags v2.4 t/m v2.6.6).
+Backup/
+
+# Windows / OneDrive
+Thumbs.db
+desktop.ini
+.DS_Store
