@@ -1,0 +1,299 @@
+.caldav-calendar {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.6;
+}
+
+.caldav-modern-grid {
+    display: grid;
+    gap: 2rem;
+}
+
+.caldav-month-section {
+    background: #ffffff;
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    border: 1px solid #e1e5e9;
+}
+
+.caldav-month-section.caldav-no-header {
+    padding-top: 0.5rem;
+}
+
+.caldav-month-header {
+    color: #2c3e50;
+    margin: 0 0 1.5rem 0;
+    font-size: 1.5rem;
+    font-weight: 600;
+    border-bottom: 2px solid #3498db;
+    padding-bottom: 0.5rem;
+}
+
+.caldav-event-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 1rem;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    background: #f8f9fa;
+    border-radius: 8px;
+    border-left: 4px solid #3498db;
+    transition: all 0.3s ease;
+}
+
+.caldav-event-card:hover {
+    background: #e9ecef;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.caldav-date-badge {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background: #3498db;
+    color: white;
+    border-radius: 8px;
+    padding: 0.5rem;
+    min-width: 60px;
+    text-align: center;
+}
+
+.caldav-day {
+    font-size: 1.5rem;
+    font-weight: bold;
+    line-height: 1;
+}
+
+.caldav-month {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.caldav-event-content {
+    flex: 1;
+}
+
+.caldav-event-title {
+    margin: 0 0 0.5rem 0;
+    color: #2c3e50;
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+
+.caldav-event-time,
+.caldav-event-location {
+    font-size: 0.9rem;
+    color: #7f8c8d;
+    margin-bottom: 0.5rem;
+}
+
+.caldav-event-description {
+    color: #5a6c7d;
+    font-size: 0.9rem;
+    margin-top: 0.5rem;
+}
+
+.caldav-error,
+.caldav-no-events {
+    background: #fee;
+    color: #c33;
+    padding: 1rem;
+    border-radius: 6px;
+    border: 1px solid #fcc;
+}
+
+.caldav-theme-blue .caldav-month-section {
+    background: #f8f9ff;
+    border-color: #4a90e2;
+}
+
+.caldav-theme-blue .caldav-month-header {
+    border-color: #4a90e2;
+}
+
+.caldav-theme-blue .caldav-event-card {
+    background: #f0f4ff;
+    border-left-color: #4a90e2;
+}
+
+.caldav-theme-blue .caldav-date-badge {
+    background: #4a90e2;
+}
+
+.caldav-theme-dark .caldav-month-section {
+    background: #2c3e50;
+    color: #ecf0f1;
+    border-color: #34495e;
+}
+
+.caldav-theme-dark .caldav-month-header {
+    color: #ecf0f1;
+    border-color: #e74c3c;
+}
+
+.caldav-theme-dark .caldav-event-card {
+    background: #34495e;
+    border-left-color: #e74c3c;
+}
+
+.caldav-theme-dark .caldav-event-title {
+    color: #ecf0f1;
+}
+
+.caldav-theme-dark .caldav-date-badge {
+    background: #e74c3c;
+}
+
+.caldav-card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1.5rem;
+}
+
+.caldav-card-standalone {
+    background: #ffffff;
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    border: 1px solid #e1e5e9;
+    display: flex;
+    align-items: flex-start;
+    gap: 1rem;
+    transition: all 0.3s ease;
+}
+
+.caldav-card-standalone:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+}
+
+.caldav-events-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.caldav-month-divider {
+    background: #f8f9fa;
+    padding: 1rem;
+    margin: 1.5rem 0 1rem 0;
+    border-radius: 6px;
+    border-left: 4px solid #3498db;
+}
+
+.caldav-month-divider h4 {
+    margin: 0;
+    color: #2c3e50;
+    font-size: 1.3rem;
+    font-weight: 600;
+}
+
+.caldav-event-item {
+    display: flex;
+    gap: 1rem;
+    padding: 1rem;
+    margin-bottom: 0.5rem;
+    background: #fff;
+    border-radius: 6px;
+    border: 1px solid #e1e5e9;
+    transition: all 0.3s ease;
+}
+
+.caldav-event-item:hover {
+    background: #f8f9fa;
+    border-color: #3498db;
+}
+
+.caldav-event-date {
+    min-width: 120px;
+    margin: 0;
+    font-size: 0.9rem;
+    color: #7f8c8d;
+    font-weight: 500;
+}
+
+.caldav-event-details {
+    flex: 1;
+}
+
+.caldav-event-datetime {
+    margin-top: 0.5rem;
+    color: #7f8c8d;
+}
+
+.caldav-events {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.caldav-events .caldav-month {
+    list-style: none;
+    margin: 1.5rem 0 0.5rem 0;
+}
+
+.caldav-events .caldav-month h4 {
+    color: #2c3e50;
+    margin: 0;
+    font-size: 1.2rem;
+    font-weight: 600;
+}
+
+.caldav-events .caldav-event {
+    list-style: none;
+    margin-bottom: 1rem;
+    padding: 0;
+}
+
+.caldav-events .caldav-event h5 {
+    color: #34495e;
+    margin: 0.5rem 0 0.3rem 0;
+    font-size: 1rem;
+    font-weight: 500;
+}
+
+.caldav-events .caldav-summary {
+    margin: 0.3rem 0;
+    font-size: 1rem;
+}
+
+.caldav-events .caldav-time {
+    margin: 0.3rem 0;
+    font-size: 1rem;
+    color: #2c3e50;
+}
+
+.caldav-events .caldav-description {
+    margin: 0.3rem 0;
+    color: #666;
+    font-size: 0.9rem;
+}
+
+@media (max-width: 768px) {
+    .caldav-event-card,
+    .caldav-card-standalone {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .caldav-date-badge {
+        flex-direction: row;
+        justify-content: center;
+        gap: 0.5rem;
+    }
+
+    .caldav-card-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .caldav-event-item {
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+
+    .caldav-event-date {
+        min-width: auto;
+    }
+}
