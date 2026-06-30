@@ -4,7 +4,7 @@ Tags: caldav, calendar, agenda, ical, events
 Requires at least: 5.0
 Tested up to: 6.7
 Requires PHP: 7.4
-Stable tag: 2.5
+Stable tag: 2.6.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -21,6 +21,7 @@ Modern CalDAV Calendar haalt evenementen op uit een CalDAV-server (zoals Nextclo
 * Ondersteuning voor recurring events (RRULE) — dagelijks, wekelijks, maandelijks, jaarlijks
 * RRULE-filters: BYDAY, BYMONTHDAY, INTERVAL, COUNT, UNTIL
 * Nederlandse lokalisatie: weekdagen en maanden in het Nederlands
+* Meertaligheid via `lang`-parameter: datums/weekdagen automatisch vertaald, titel/beschrijving via DeepL
 * Configureerbare caching (60-3600 seconden)
 * Meerdere CalDAV-verbindingen beheerbaar via admin
 * Rate limiting tegen misbruik
@@ -83,6 +84,31 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 
 == Changelog ==
 
+= 2.6.3 =
+* Stabiliteit: geen witte pagina's meer — hele shortcode in een try/catch-vangnet, kortere timeouts (CalDAV 15s, DeepL 8s) zodat een trage server PHP niet laat crashen
+* Terugval op "laatst bekende goede agenda" bij een ophaal-/serverfout, zodat de kalender nooit leeg/wit wordt (per verbinding bewaard)
+* Info-box verschijnt nu ook bij translation_notice="no" wanneer de vertaling (deels) mislukt en de inhoud in het Nederlands valt, zodat de bezoeker de terugval begrijpt
+* Lukt de vertaling volledig, dan blijft translation_notice="no" box-loos zoals bedoeld
+
+= 2.6.2 =
+* Vertaal-melding omgezet naar een oranje waarschuwingsbox met icoon, inline gestyled (rendert altijd, ook bij gecachete CSS)
+* Nieuwe parameter `translation_notice` (yes/no) om de box per shortcode aan/uit te zetten — handig om 'm te verbergen bij een count=1 widget
+
+= 2.6.1 =
+* Fix: DeepL "too many requests" (429) opgelost — vertalingen worden nu gebatcht (alle titels in 1 verzoek, alle beschrijvingen in 1 verzoek) i.p.v. per event
+* Dubbele teksten (bijv. terugkerende beschrijvingen) worden maar één keer vertaald
+* Cooldown/backoff bij rate-limit of quota-fout: geen herhaald bestoken van DeepL meer
+* Elke unieke tekst wordt precies één keer vertaald en 30 dagen gecachet; alleen nieuwe/gewijzigde teksten triggeren een vertaling
+* Nieuw: kleine info-box boven de kalender bij een andere taal dan NL ("automatisch vertaald"), die meekleurt met het gekozen thema (default/blue/dark)
+* Op een vertaalde pagina worden geen (Nederlandse) foutmeldingen meer aan bezoekers getoond — stille terugval, fouten gaan alleen naar het debug-log
+
+= 2.6 =
+* Meertaligheid: nieuwe `lang`-parameter (nl, en, de, fr, es) op de shortcode
+* Datums en weekdagen worden taalbewust weergegeven (geen API nodig)
+* Titel en beschrijving optioneel automatisch vertaald via DeepL, met 30-daagse caching
+* DeepL API-key instelbaar onder Instellingen (valt zacht terug op Nederlands zonder key)
+* "Geen evenementen"-melding taalbewust
+
 = 2.5 =
 * Architectuurwijziging: credentials verplaatst van shortcode naar admin-instellingen
 * Nieuwe Verbindingen-tab voor het beheer van meerdere CalDAV-koppelingen
@@ -114,6 +140,9 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 * Initiële versie met ABSPATH-check en basisbeveiliging
 
 == Upgrade Notice ==
+
+= 2.6 =
+Nieuwe `lang`-parameter voor meertalige weergave. Vul optioneel een DeepL API-key in onder Instellingen om titel en beschrijving automatisch te laten vertalen.
 
 = 2.5 =
 Belangrijke wijziging: credentials moeten nu in admin-instellingen worden ingevoerd in plaats van in de shortcode. Zie de upgrade-instructies in de plugin documentatie.

@@ -1,8 +1,8 @@
 <?php
 /*
 Plugin Name: Modern CalDAV Calendar
-Description: Moderne CalDAV kalender plugin met styling, herhalingen en veiligheid. Credentials beheerd via admin-instellingen.
-Version: 2.5
+Description: Moderne CalDAV kalender plugin met styling, herhalingen en veiligheid. Credentials beheerd via admin-instellingen. Optionele meertaligheid via DeepL.
+Version: 2.6.3
 Author: Bolt Connect
 Requires at least: 5.0
 Tested up to: 6.7
@@ -17,7 +17,7 @@ if (!defined('ABSPATH')) {
     exit('Direct access not permitted.');
 }
 
-define('CALDAV_PLUGIN_VERSION', '2.5');
+define('CALDAV_PLUGIN_VERSION', '2.6.3');
 define('CALDAV_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('CALDAV_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -42,6 +42,7 @@ function caldav_plugin_activate() {
     add_option('caldav_cache_enabled', true);
     add_option('caldav_cache_duration', 300);
     add_option('caldav_connections', []);
+    add_option('caldav_deepl_api_key', '');
     add_option('caldav_show_activation_notice', true);
 }
 
@@ -137,6 +138,25 @@ function caldav_clear_all_cache() {
     $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_caldav_cache_%'");
 }
 
+// "Laatst bekende goede" agenda per verbinding. Wordt bij elke geslaagde fetch
+// opgeslagen en gebruikt als terugval als de CalDAV-server later even faalt,
+// zodat de kalender nooit leeg/wit wordt. Bewaard als (niet-autoloaded) option,
+// dus blijft staan ook als de transient-cache wordt geleegd.
+function caldav_store_lastgood($slug, $events) {
+    if (empty($slug) || empty($events)) {
+        return;
+    }
+    update_option('caldav_lastgood_' . $slug, $events, false);
+}
+
+function caldav_get_lastgood($slug) {
+    if (empty($slug)) {
+        return [];
+    }
+    $events = get_option('caldav_lastgood_' . $slug, []);
+    return is_array($events) ? $events : [];
+}
+
 function caldav_log_error($message, $context = []) {
     if (defined('WP_DEBUG') && WP_DEBUG && defined('WP_DEBUG_LOG') && WP_DEBUG_LOG) {
         $log_message = 'CalDAV Calendar: ' . $message;
@@ -161,6 +181,174 @@ function caldav_check_rate_limit($url) {
 
     set_transient($rate_limit_key, $requests + 1, 60);
     return true;
+}
+
+// === TRANSLATION (DeepL) ===
+
+// Talen die de plugin als doeltaal accepteert in de shortcode.
+// 'nl' is de brontaal en wordt nooit vertaald.
+function caldav_supported_languages() {
+    return ['nl', 'en', 'de', 'fr', 'es'];
+}
+
+// Cache-sleutel voor één vertaalde bron-tekst.
+function caldav_tr_cache_key($target, $is_html, $text) {
+    return 'caldav_tr_' . md5($target . '|' . ($is_html ? 'h|' : 't|') . $text);
+}
+
+// Haal een eerder gecachete vertaling op (of false).
+function caldav_tr_cached($target, $is_html, $text) {
+    $text = trim((string) $text);
+    if ($text === '') {
+        return '';
+    }
+    return get_transient(caldav_tr_cache_key($target, $is_html, $text));
+}
+
+// Vertaal een set unieke teksten in zo min mogelijk DeepL-verzoeken (batch).
+// Elke geslaagde vertaling wordt 30 dagen gecachet. Bij een rate-limit (429),
+// quota-fout (456), netwerk- of HTTP-fout wordt een korte cooldown gezet zodat
+// de plugin DeepL niet bij elke paginaweergave blijft bestoken; de teksten
+// blijven dan tijdelijk Nederlands en worden later alsnog vertaald.
+function caldav_deepl_translate_batch($texts, $target, $is_html, $api_key) {
+    $texts = array_values(array_unique(array_filter(array_map('trim', $texts), 'strlen')));
+    if (empty($texts)) {
+        return;
+    }
+
+    // Een gratis DeepL-key eindigt op ':fx' en gebruikt een ander endpoint.
+    $endpoint = (substr($api_key, -3) === ':fx')
+        ? 'https://api-free.deepl.com/v2/translate'
+        : 'https://api.deepl.com/v2/translate';
+
+    // Max 40 teksten per verzoek (DeepL staat er 50 toe — veilige marge).
+    foreach (array_chunk($texts, 40) as $chunk) {
+        $payload = [
+            'text'        => $chunk,
+            'source_lang' => 'NL',
+            'target_lang' => strtoupper($target),
+        ];
+        if ($is_html) {
+            // Behoudt <br> en andere tags in de beschrijving.
+            $payload['tag_handling'] = 'html';
+        }
+
+        $response = wp_remote_post($endpoint, [
+            'timeout' => 8,
+            'headers' => [
+                'Authorization' => 'DeepL-Auth-Key ' . $api_key,
+                'Content-Type'  => 'application/json',
+            ],
+            'body' => wp_json_encode($payload),
+        ]);
+
+        if (is_wp_error($response)) {
+            caldav_log_error('DeepL request failed', ['error' => $response->get_error_message()]);
+            set_transient('caldav_tr_cooldown', 1, 2 * MINUTE_IN_SECONDS);
+            return;
+        }
+
+        $code = (int) wp_remote_retrieve_response_code($response);
+        if ($code === 429 || $code === 456 || $code === 529) {
+            // Te veel verzoeken / quota op → langer terugtrekken.
+            caldav_log_error('DeepL rate/quota limit', ['code' => $code]);
+            set_transient('caldav_tr_cooldown', 1, 5 * MINUTE_IN_SECONDS);
+            return;
+        }
+        if ($code !== 200) {
+            caldav_log_error('DeepL HTTP error', ['code' => $code]);
+            set_transient('caldav_tr_cooldown', 1, 2 * MINUTE_IN_SECONDS);
+            return;
+        }
+
+        $data = json_decode(wp_remote_retrieve_body($response), true);
+        $translations = $data['translations'] ?? [];
+        foreach ($chunk as $i => $src) {
+            $translated = $translations[$i]['text'] ?? null;
+            if ($translated !== null && $translated !== '') {
+                set_transient(caldav_tr_cache_key($target, $is_html, $src), $translated, 30 * DAY_IN_SECONDS);
+            }
+        }
+    }
+}
+
+// Vertaal titel + beschrijving van de zichtbare events (tot 'count').
+// Werkwijze: eerst de cache vullen voor alle nog-onvertaalde unieke teksten
+// (gebatcht, max 2 DeepL-verzoeken per render), daarna uit de cache toepassen.
+// Alleen nieuwe/gewijzigde teksten kosten dus een vertaling.
+// $incomplete (per referentie) wordt true als minstens één zichtbare tekst
+// niet vertaald kon worden en dus in het Nederlands wordt getoond.
+function caldav_translate_events($events, $options, &$incomplete = false) {
+    $target = strtolower($options['lang'] ?? 'nl');
+    if ($target === 'nl') {
+        return $events;
+    }
+
+    $api_key = trim(get_option('caldav_deepl_api_key', ''));
+    if (empty($api_key)) {
+        $incomplete = true; // geen key → niets vertaald, blijft Nederlands
+        return $events;
+    }
+
+    $limit = max(1, intval($options['count']));
+
+    // 1. Verzamel de unieke teksten die nog niet in de cache staan.
+    $need_titles = [];
+    $need_descs  = [];
+    $n = 0;
+    foreach ($events as $event) {
+        if ($n++ >= $limit) {
+            break;
+        }
+        $summary = trim($event['summary'] ?? '');
+        if ($summary !== '' && caldav_tr_cached($target, false, $summary) === false) {
+            $need_titles[$summary] = true;
+        }
+        $desc = trim($event['description'] ?? '');
+        if ($desc !== '' && caldav_tr_cached($target, true, $desc) === false) {
+            $need_descs[$desc] = true;
+        }
+    }
+
+    // 2. Vul de cache (tenzij we net een rate-limit raakten → cooldown actief).
+    if ((!empty($need_titles) || !empty($need_descs)) && !get_transient('caldav_tr_cooldown')) {
+        if (!empty($need_titles)) {
+            caldav_deepl_translate_batch(array_keys($need_titles), $target, false, $api_key);
+        }
+        if (!empty($need_descs)) {
+            caldav_deepl_translate_batch(array_keys($need_descs), $target, true, $api_key);
+        }
+    }
+
+    // 3. Pas toe uit de cache; niet-gevonden teksten blijven Nederlands en
+    //    markeren de vertaling als onvolledig.
+    $n = 0;
+    foreach ($events as &$event) {
+        if ($n++ >= $limit) {
+            break;
+        }
+        $summary = trim($event['summary'] ?? '');
+        if ($summary !== '') {
+            $cached = caldav_tr_cached($target, false, $summary);
+            if ($cached !== false && $cached !== '') {
+                $event['summary'] = $cached;
+            } else {
+                $incomplete = true;
+            }
+        }
+        $desc = trim($event['description'] ?? '');
+        if ($desc !== '') {
+            $cached = caldav_tr_cached($target, true, $desc);
+            if ($cached !== false && $cached !== '') {
+                $event['description'] = $cached;
+            } else {
+                $incomplete = true;
+            }
+        }
+    }
+    unset($event);
+
+    return $events;
 }
 
 // === ADMIN ===
@@ -224,8 +412,10 @@ function caldav_handle_admin_actions() {
         && wp_verify_nonce($_POST['caldav_nonce'] ?? '', 'caldav_update_settings')) {
         $cache_enabled = isset($_POST['cache_enabled']);
         $cache_duration = max(60, min(3600, intval($_POST['cache_duration'] ?? 300)));
+        $deepl_key = sanitize_text_field($_POST['deepl_api_key'] ?? '');
         update_option('caldav_cache_enabled', $cache_enabled);
         update_option('caldav_cache_duration', $cache_duration);
+        update_option('caldav_deepl_api_key', $deepl_key);
         add_settings_error('caldav', 'saved', 'Instellingen opgeslagen.', 'updated');
     }
 
@@ -411,6 +601,7 @@ function caldav_render_settings_tab() {
 
     $cache_enabled = get_option('caldav_cache_enabled', true);
     $cache_duration = get_option('caldav_cache_duration', 300);
+    $deepl_key = get_option('caldav_deepl_api_key', '');
     ?>
     <h2>Cache & instellingen</h2>
 
@@ -419,6 +610,22 @@ function caldav_render_settings_tab() {
         <input type="hidden" name="caldav_action" value="update_settings">
 
         <table class="form-table">
+            <tr>
+                <th scope="row"><label for="caldav-deepl-key">DeepL API-key</label></th>
+                <td>
+                    <input id="caldav-deepl-key" type="password" name="deepl_api_key" class="regular-text"
+                           autocomplete="off" value="<?php echo esc_attr($deepl_key); ?>">
+                    <p class="description">
+                        Optioneel. Nodig voor automatische vertaling van titel en beschrijving
+                        bij <code>lang="en"</code> (of een andere taal) in de shortcode. Zonder key
+                        blijven titel/beschrijving in het Nederlands; alleen datums/weekdagen worden
+                        dan nog vertaald. Een gratis key (eindigt op <code>:fx</code>) werkt tot
+                        500.000 tekens/maand. Aanvragen via
+                        <a href="https://www.deepl.com/pro-api" target="_blank" rel="noopener">deepl.com/pro-api</a>.
+                        Vertalingen worden 30 dagen gecachet.
+                    </p>
+                </td>
+            </tr>
             <tr>
                 <th scope="row">Cache inschakelen</th>
                 <td>
@@ -485,8 +692,25 @@ function caldav_render_help_tab() {
             <tr><td><code>nomonthheaders</code></td><td>Maandkoppen verbergen</td><td>false</td><td>true, false</td></tr>
             <tr><td><code>show_time</code></td><td>Tijd weergeven</td><td>yes</td><td>yes, no</td></tr>
             <tr><td><code>show_description</code></td><td>Beschrijving weergeven</td><td>yes</td><td>yes, no</td></tr>
+            <tr><td><code>lang</code></td><td>Taal van de weergave</td><td>nl</td><td>nl, en, de, fr, es</td></tr>
+            <tr><td><code>translation_notice</code></td><td>Vertaal-melding (oranje box) tonen bij niet-NL</td><td>yes</td><td>yes, no</td></tr>
         </tbody>
     </table>
+
+    <div style="background:#e7f4ff;border:1px solid #b8daff;padding:15px;border-radius:5px;margin-top:20px;">
+        <h4>Meertaligheid (vanaf v2.6)</h4>
+        <p>De agenda wordt altijd in het Nederlands ingevoerd. Met de <code>lang</code>-parameter
+        toon je dezelfde agenda automatisch in een andere taal:</p>
+        <ul style="list-style:disc;margin-left:20px;">
+            <li><strong>Datums en weekdagen</strong> worden altijd vertaald (gratis, geen API nodig).</li>
+            <li><strong>Titel en beschrijving</strong> worden vertaald via DeepL — vul daarvoor een
+            API-key in onder het tabblad <strong>Instellingen</strong>. Zonder key blijven titel en
+            beschrijving Nederlands.</li>
+        </ul>
+        <p>Plaats op je Engelse pagina (bijv. <code>/en</code>) simpelweg de shortcode met
+        <code>lang="en"</code>. Vertalingen worden 30 dagen gecachet, dus terugkerende diensten
+        kosten na de eerste keer niets meer.</p>
+    </div>
 
     <h3>Voorbeelden</h3>
     <h4>Volgende evenement zonder maandkop</h4>
@@ -497,6 +721,12 @@ function caldav_render_help_tab() {
 
     <h4>Moderne kaart weergave</h4>
     <code>[caldav_calendar connection="mijn-agenda" view="card" theme="dark" count="15"]</code>
+
+    <h4>Engelse versie (voor /en-pagina)</h4>
+    <code>[caldav_calendar connection="mijn-agenda" lang="en"]</code>
+
+    <h4>Engels, één los event zonder vertaal-melding (widget)</h4>
+    <code>[caldav_calendar connection="mijn-agenda" lang="en" count="1" translation_notice="no"]</code>
 
     <div style="background:#fff3cd;border:1px solid #ffeaa7;padding:15px;border-radius:5px;margin-top:20px;">
         <h4>Beveiligingsnotitie</h4>
@@ -636,7 +866,36 @@ function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options) {
 
 // === MAIN SHORTCODE ===
 
+// Publieke shortcode-handler met vangnet: vangt elke onverwachte fout
+// (Throwable) af zodat de pagina nooit wit wordt. Bij een fout proberen we
+// nog de laatst bekende goede agenda in het Nederlands te tonen.
 function caldav_calendar_shortcode($atts) {
+    try {
+        return caldav_calendar_shortcode_impl($atts);
+    } catch (\Throwable $e) {
+        caldav_log_error('Shortcode exception', ['error' => $e->getMessage()]);
+        $a = shortcode_atts(['connection' => ''], $atts, 'caldav_calendar');
+        $slug = caldav_sanitize_slug($a['connection'] ?? '');
+        $lastgood = caldav_get_lastgood($slug);
+        if (!empty($lastgood)) {
+            usort($lastgood, function ($x, $y) {
+                return $x['start'] <=> $y['start'];
+            });
+            // Bewust in het NL renderen: geen nieuwe DeepL-calls die opnieuw
+            // zouden kunnen falen.
+            return caldav_generate_output($lastgood, [
+                'count' => 10, 'view' => 'old', 'theme' => 'default',
+                'show_time' => 'yes', 'show_description' => 'yes',
+                'htmltagmonth' => 'h4', 'htmltagdate' => 'h5',
+                'date_format' => 'd-m-Y H:i', 'nomonthheaders' => 'false',
+                'lang' => 'nl', 'translation_notice' => 'no',
+            ]);
+        }
+        return '';
+    }
+}
+
+function caldav_calendar_shortcode_impl($atts) {
     $a = shortcode_atts(array(
         'connection' => '',
         'count' => 10,
@@ -649,25 +908,37 @@ function caldav_calendar_shortcode($atts) {
         'show_time' => 'yes',
         'show_description' => 'yes',
         'theme' => 'default',
-        'nomonthheaders' => 'false'
+        'nomonthheaders' => 'false',
+        'lang' => 'nl',
+        'translation_notice' => 'yes'
     ), $atts);
+
+    $lang = in_array(strtolower($a['lang']), caldav_supported_languages()) ? strtolower($a['lang']) : 'nl';
+
+    // Op een vertaalde (niet-NL) pagina tonen we geen Nederlandse foutmeldingen
+    // aan bezoekers: daar valt alles stil terug (lege output) i.p.v. een rode
+    // melding. Fouten gaan nog wel naar het debug-log. Op de NL-pagina (de
+    // primaire weergave) blijven de meldingen gewoon zichtbaar.
+    $err = function ($dutch_error_html) use ($lang) {
+        return $lang === 'nl' ? $dutch_error_html : '';
+    };
 
     // Resolve connection
     $slug = caldav_sanitize_slug($a['connection']);
     if (empty($slug)) {
-        return '<div class="caldav-error">Geen verbinding opgegeven. Gebruik <code>connection="slug"</code> en maak eerst een verbinding aan onder Instellingen &gt; CalDAV Calendar.</div>';
+        return $err('<div class="caldav-error">Geen verbinding opgegeven. Gebruik <code>connection="slug"</code> en maak eerst een verbinding aan onder Instellingen &gt; CalDAV Calendar.</div>');
     }
 
     $connection = caldav_get_connection($slug);
     if (!$connection) {
         caldav_log_error('Connection not found', ['slug' => $slug]);
-        return '<div class="caldav-error">Verbinding "' . esc_html($slug) . '" niet gevonden.</div>';
+        return $err('<div class="caldav-error">Verbinding "' . esc_html($slug) . '" niet gevonden.</div>');
     }
 
     $url = caldav_sanitize_url($connection['url'] ?? '');
     if (!$url) {
         caldav_log_error('Invalid URL in connection', ['slug' => $slug]);
-        return '<div class="caldav-error">Verbinding "' . esc_html($slug) . '" heeft een ongeldige URL.</div>';
+        return $err('<div class="caldav-error">Verbinding "' . esc_html($slug) . '" heeft een ongeldige URL.</div>');
     }
 
     $user = sanitize_text_field($connection['user'] ?? '');
@@ -687,11 +958,12 @@ function caldav_calendar_shortcode($atts) {
     $show_time = in_array($a['show_time'], ['yes', 'no']) ? $a['show_time'] : 'yes';
     $show_description = in_array($a['show_description'], ['yes', 'no']) ? $a['show_description'] : 'yes';
     $nomonthheaders = in_array($a['nomonthheaders'], ['true', 'false']) ? $a['nomonthheaders'] : 'false';
+    $translation_notice = in_array($a['translation_notice'], ['yes', 'no']) ? $a['translation_notice'] : 'yes';
 
     // Rate limiting
     if (!caldav_check_rate_limit($url)) {
         caldav_log_error('Rate limit exceeded', ['url' => $url]);
-        return '<div class="caldav-error">Te veel verzoeken. Probeer over een minuut opnieuw.</div>';
+        return $err('<div class="caldav-error">Te veel verzoeken. Probeer over een minuut opnieuw.</div>');
     }
 
     // Check cache
@@ -712,12 +984,28 @@ function caldav_calendar_shortcode($atts) {
         'htmltagmonth' => sanitize_key($a['htmltagmonth']),
         'htmltagdate' => sanitize_key($a['htmltagdate']),
         'date_format' => sanitize_text_field($a['date_format']),
-        'nomonthheaders' => $nomonthheaders
+        'nomonthheaders' => $nomonthheaders,
+        'lang' => $lang,
+        'translation_notice' => $translation_notice
     ];
 
     if ($cached_events !== false) {
         return caldav_generate_output($cached_events, $clean_options);
     }
+
+    // Terugval bij een ophaal-/serverfout: toon de laatst bekende goede agenda
+    // i.p.v. een lege/foutpagina. Pas als die er ook niet is, val terug op de
+    // (op niet-NL onderdrukte) foutmelding.
+    $fallback = function ($dutch_error_html) use ($slug, $clean_options, $err) {
+        $lastgood = caldav_get_lastgood($slug);
+        if (!empty($lastgood)) {
+            usort($lastgood, function ($a, $b) {
+                return $a['start'] <=> $b['start'];
+            });
+            return caldav_generate_output($lastgood, $clean_options);
+        }
+        return $err($dutch_error_html);
+    };
 
     // XML REPORT body
     $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n" .
@@ -737,7 +1025,7 @@ function caldav_calendar_shortcode($atts) {
     $ch = curl_init();
     if (!$ch) {
         caldav_log_error('Failed to initialize cURL');
-        return '<div class="caldav-error">Kon verbinding niet initialiseren.</div>';
+        return $fallback('<div class="caldav-error">Kon verbinding niet initialiseren.</div>');
     }
 
     curl_setopt_array($ch, [
@@ -750,8 +1038,8 @@ function caldav_calendar_shortcode($atts) {
             'Content-Type: application/xml; charset=utf-8',
             'User-Agent: WordPress CalDAV Plugin/' . CALDAV_PLUGIN_VERSION
         ],
-        CURLOPT_TIMEOUT => 30,
-        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_CONNECTTIMEOUT => 8,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS => 3,
         CURLOPT_SSL_VERIFYPEER => true,
@@ -770,7 +1058,7 @@ function caldav_calendar_shortcode($atts) {
 
     if ($resp === false || !empty($curl_error)) {
         caldav_log_error('cURL error', ['error' => $curl_error, 'url' => $url]);
-        return '<div class="caldav-error">Netwerkfout bij ophalen kalender: ' . esc_html($curl_error) . '</div>';
+        return $fallback('<div class="caldav-error">Netwerkfout bij ophalen kalender: ' . esc_html($curl_error) . '</div>');
     }
 
     if ($httpcode >= 400) {
@@ -782,16 +1070,16 @@ function caldav_calendar_shortcode($atts) {
             500 => 'Server fout.'
         ];
         $error_msg = $error_messages[$httpcode] ?? 'HTTP fout ' . $httpcode;
-        return '<div class="caldav-error">' . esc_html($error_msg) . '</div>';
+        return $fallback('<div class="caldav-error">' . esc_html($error_msg) . '</div>');
     }
 
     if (!preg_match_all('/<([a-zA-Z0-9]+:)?calendar-data[^>]*>(.*?)<\/([a-zA-Z0-9]+:)?calendar-data>/s', $resp, $matches)) {
         caldav_log_error('No calendar data found', ['url' => $url]);
-        return '<div class="caldav-error">Geen kalenderdata gevonden.</div>';
+        return $fallback('<div class="caldav-error">Geen kalenderdata gevonden.</div>');
     }
 
     if (empty($matches[2])) {
-        return '<div class="caldav-error">Geen iCalendar data ontvangen.</div>';
+        return $fallback('<div class="caldav-error">Geen iCalendar data ontvangen.</div>');
     }
 
     $ical_data = implode("\n", $matches[2]);
@@ -804,7 +1092,8 @@ function caldav_calendar_shortcode($atts) {
     $events = caldav_parse_events($ical, $parse_options);
 
     if (empty($events)) {
-        return '<div class="caldav-no-events">Geen komende evenementen gevonden.</div>';
+        $no_events = $lang === 'nl' ? 'Geen komende evenementen gevonden.' : 'No upcoming events found.';
+        return '<div class="caldav-no-events">' . esc_html($no_events) . '</div>';
     }
 
     caldav_cache_events($cache_key, $events);
@@ -812,6 +1101,9 @@ function caldav_calendar_shortcode($atts) {
     usort($events, function($a, $b) {
         return $a['start'] <=> $b['start'];
     });
+
+    // Bewaar als laatst bekende goede agenda voor terugval bij latere fouten.
+    caldav_store_lastgood($slug, $events);
 
     return caldav_generate_output($events, $clean_options);
 }
@@ -921,15 +1213,65 @@ function caldav_parse_events($ical, $options) {
 
 // === OUTPUT GENERATORS ===
 
+// Waarschuwingsbox boven de kalender bij een andere taal dan NL: de agenda
+// wordt automatisch vertaald en kan deels Nederlands blijven (fallback).
+// Styling staat inline zodat de box altijd goed rendert, ook als de externe
+// CSS nog gecachet is.
+function caldav_translation_notice($lang) {
+    $lang = strtolower($lang);
+    if ($lang === 'nl') {
+        return '';
+    }
+
+    $messages = [
+        'en' => 'This calendar is automatically translated from Dutch. Some details may still appear in Dutch.',
+        'de' => 'Dieser Kalender wird automatisch aus dem Niederländischen übersetzt. Einige Angaben können noch auf Niederländisch erscheinen.',
+        'fr' => 'Ce calendrier est traduit automatiquement du néerlandais. Certains détails peuvent encore apparaître en néerlandais.',
+        'es' => 'Este calendario se traduce automáticamente del neerlandés. Algunos detalles pueden seguir apareciendo en neerlandés.',
+    ];
+    $msg = $messages[$lang] ?? $messages['en'];
+
+    $box  = 'display:flex;align-items:flex-start;gap:10px;'
+          . 'margin:0 0 1.25rem 0;padding:12px 14px;'
+          . 'background:#fff7e6;border:1px solid #f0c36d;'
+          . 'border-left:4px solid #e69500;border-radius:8px;'
+          . 'color:#6b4b00;font-size:.88rem;line-height:1.45;';
+    $icon = 'flex:none;color:#e69500;font-size:1.2rem;line-height:1.2;';
+
+    return '<div class="caldav-translation-notice" role="note" style="' . $box . '">' .
+           '<span aria-hidden="true" style="' . $icon . '">&#9888;</span>' .
+           '<span style="flex:1;">' . esc_html($msg) . '</span>' .
+           '</div>';
+}
+
 function caldav_generate_output($events, $options) {
+    $lang = strtolower($options['lang'] ?? 'nl');
+
+    // Titel + beschrijving vertalen indien een andere taal dan NL is gevraagd.
+    // $incomplete = true als minstens één zichtbare tekst Nederlands bleef.
+    $incomplete = false;
+    if ($lang !== 'nl') {
+        $events = caldav_translate_events($events, $options, $incomplete);
+    }
+
+    // Info-box boven de kalender. Tonen bij een andere taal dan NL wanneer:
+    //  - translation_notice="yes" (standaard), OF
+    //  - de vertaling (deels) mislukte en de inhoud in het Nederlands valt —
+    //    dan tonen we de box óók bij translation_notice="no", zodat de bezoeker
+    //    begrijpt waarom hij Nederlands ziet i.p.v. de gevraagde taal.
+    $want_notice = ($options['translation_notice'] ?? 'yes') !== 'no';
+    $show_notice = ($lang !== 'nl') && ($want_notice || $incomplete);
+    $notice = $show_notice ? caldav_translation_notice($lang) : '';
+
     if ($options['view'] === 'old' || $options['view'] === 'simple') {
-        return caldav_generate_old_view($events, $options);
+        return $notice . caldav_generate_old_view($events, $options);
     }
 
     $theme_class = 'caldav-theme-' . $options['theme'];
     $view_class = 'caldav-view-' . $options['view'];
 
     $out = '<div class="caldav-calendar ' . $theme_class . ' ' . $view_class . '">';
+    $out .= $notice;
 
     switch ($options['view']) {
         case 'card':
@@ -1084,6 +1426,10 @@ function caldav_generate_old_view($events, $options) {
         'Sunday' => 'zondag'
     );
 
+    // Alleen bij NL de eigen vertaaltabel gebruiken; andere talen tonen de
+    // Engelse namen die PHP's date()-format al levert (Friday, October, …).
+    $useDutch = strtolower($options['lang'] ?? 'nl') === 'nl';
+
     foreach ($events as $event) {
         $month = $event['start']->format('F Y');
 
@@ -1091,16 +1437,22 @@ function caldav_generate_old_view($events, $options) {
         $dayNumber = $event['start']->format('j');
         $monthName = $event['start']->format('F');
 
-        $dayDutch = isset($days[$dayName]) ? ucfirst($days[$dayName]) : ucfirst(strtolower($dayName));
-        $monthNameDutch = isset($months[$monthName]) ? $months[$monthName] : strtolower($monthName);
+        $dayLabel = $useDutch
+            ? (isset($days[$dayName]) ? ucfirst($days[$dayName]) : ucfirst(strtolower($dayName)))
+            : $dayName;
+        $monthLabel = $useDutch
+            ? (isset($months[$monthName]) ? $months[$monthName] : strtolower($monthName))
+            : $monthName;
 
-        $dateReadable = $dayDutch . ' ' . $dayNumber . ' ' . $monthNameDutch;
+        $dateReadable = $dayLabel . ' ' . $dayNumber . ' ' . $monthLabel;
 
         if ($month !== $currentMonth && $options['nomonthheaders'] !== 'true') {
             $monthOnly = $event['start']->format('F');
             $year = $event['start']->format('Y');
-            $monthDutchOnly = isset($months[$monthOnly]) ? $months[$monthOnly] : strtolower($monthOnly);
-            $monthFormatted = ucfirst($monthDutchOnly) . ' ' . $year;
+            $monthHeadLabel = $useDutch
+                ? (isset($months[$monthOnly]) ? $months[$monthOnly] : strtolower($monthOnly))
+                : $monthOnly;
+            $monthFormatted = ucfirst($monthHeadLabel) . ' ' . $year;
             $out .= '<li class="caldav-month"><' . $options['htmltagmonth'] . '>' . esc_html($monthFormatted) . '</' . $options['htmltagmonth'] . '></li>';
             $currentMonth = $month;
         }
