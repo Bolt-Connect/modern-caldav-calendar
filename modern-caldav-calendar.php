@@ -2,10 +2,10 @@
 /*
 Plugin Name: Modern CalDAV Calendar
 Description: Moderne CalDAV kalender plugin met styling, herhalingen en veiligheid. Credentials beheerd via admin-instellingen. Optionele meertaligheid via DeepL.
-Version: 2.6.3
+Version: 2.6.4
 Author: Bolt Connect
 Requires at least: 5.0
-Tested up to: 6.7
+Tested up to: 7.0
 Requires PHP: 7.4
 License: GPL v2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -17,7 +17,7 @@ if (!defined('ABSPATH')) {
     exit('Direct access not permitted.');
 }
 
-define('CALDAV_PLUGIN_VERSION', '2.6.3');
+define('CALDAV_PLUGIN_VERSION', '2.6.4');
 define('CALDAV_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('CALDAV_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -79,6 +79,8 @@ function caldav_delete_connection($slug) {
     $connections = caldav_get_connections();
     unset($connections[$slug]);
     update_option('caldav_connections', $connections);
+    // Laat geen verweesde terugval-/statusopties achter in wp_options.
+    caldav_delete_connection_state($slug);
 }
 
 function caldav_sanitize_slug($slug) {
@@ -147,6 +149,7 @@ function caldav_store_lastgood($slug, $events) {
         return;
     }
     update_option('caldav_lastgood_' . $slug, $events, false);
+    update_option('caldav_lastgood_time_' . $slug, time(), false);
 }
 
 function caldav_get_lastgood($slug) {
@@ -155,6 +158,72 @@ function caldav_get_lastgood($slug) {
     }
     $events = get_option('caldav_lastgood_' . $slug, []);
     return is_array($events) ? $events : [];
+}
+
+// Tijdstip van de laatste geslaagde ophaalactie (0 = onbekend).
+function caldav_get_lastgood_time($slug) {
+    if (empty($slug)) {
+        return 0;
+    }
+    return (int) get_option('caldav_lastgood_time_' . $slug, 0);
+}
+
+// === HEALTH / STATUS (v2.6.4) ===
+//
+// De terugval op de "laatst bekende goede agenda" (v2.6.3) voorkomt een lege
+// pagina, maar verbergt daarmee ook een kapotte verbinding: bezoekers zien een
+// nette agenda terwijl die in werkelijkheid bevroren is. Daarom houden we per
+// verbinding de laatste fout bij en waarschuwen we de beheerder in wp-admin.
+
+function caldav_get_fetch_error($slug) {
+    if (empty($slug)) {
+        return null;
+    }
+    $status = get_option('caldav_status_' . $slug, null);
+    return (is_array($status) && !empty($status['message'])) ? $status : null;
+}
+
+// Leg een mislukte ophaalactie vast. Schrijft hooguit eens per 5 minuten naar
+// de database (of direct bij een nieuwe foutmelding), zodat een kapotte
+// verbinding op een drukke pagina geen schrijfactie per paginaweergave geeft.
+function caldav_record_fetch_error($slug, $message) {
+    if (empty($slug) || $message === '') {
+        return;
+    }
+
+    $existing = get_option('caldav_status_' . $slug, null);
+    if (is_array($existing)
+        && ($existing['message'] ?? '') === $message
+        && (time() - (int) ($existing['time'] ?? 0)) < 5 * MINUTE_IN_SECONDS) {
+        return;
+    }
+
+    update_option('caldav_status_' . $slug, [
+        'message' => $message,
+        'time'    => time(),
+        // Eerste keer dat deze storing optrad; blijft staan zolang de fout duurt.
+        'since'   => (is_array($existing) && !empty($existing['since'])) ? (int) $existing['since'] : time(),
+    ], false);
+}
+
+// Wis de foutstatus na een geslaagde ophaalactie.
+function caldav_clear_fetch_error($slug) {
+    if (empty($slug)) {
+        return;
+    }
+    if (get_option('caldav_status_' . $slug, null) !== null) {
+        delete_option('caldav_status_' . $slug);
+    }
+}
+
+// Verwijder alle opgeslagen status/terugval-data van één verbinding.
+function caldav_delete_connection_state($slug) {
+    if (empty($slug)) {
+        return;
+    }
+    delete_option('caldav_lastgood_' . $slug);
+    delete_option('caldav_lastgood_time_' . $slug);
+    delete_option('caldav_status_' . $slug);
 }
 
 function caldav_log_error($message, $context = []) {
@@ -466,6 +535,14 @@ function caldav_handle_admin_actions() {
         }
     }
 
+    // Test connection (v2.6.4)
+    if (isset($_POST['caldav_action']) && $_POST['caldav_action'] === 'test_connection'
+        && wp_verify_nonce($_POST['caldav_nonce'] ?? '', 'caldav_test_connection')) {
+        $slug = caldav_sanitize_slug($_POST['slug'] ?? '');
+        $test = caldav_run_connection_test($slug);
+        add_settings_error('caldav', 'test', $test['message'], $test['ok'] ? 'updated' : 'error');
+    }
+
     // Delete connection
     if (isset($_POST['caldav_action']) && $_POST['caldav_action'] === 'delete_connection'
         && wp_verify_nonce($_POST['caldav_nonce'] ?? '', 'caldav_delete_connection')) {
@@ -475,6 +552,63 @@ function caldav_handle_admin_actions() {
             add_settings_error('caldav', 'deleted', 'Verbinding "' . esc_html($slug) . '" verwijderd.', 'updated');
         }
     }
+}
+
+// Voer een live test uit op één verbinding: haalt de agenda echt op, telt de
+// events en werkt de statusregistratie bij. Bij succes wordt de cache geleegd,
+// zodat de site meteen de verse agenda toont in plaats van de terugval.
+function caldav_run_connection_test($slug) {
+    if (empty($slug)) {
+        return ['ok' => false, 'message' => 'Geen verbinding opgegeven.'];
+    }
+
+    $connection = caldav_get_connection($slug);
+    if (!$connection) {
+        return ['ok' => false, 'message' => 'Verbinding "' . esc_html($slug) . '" niet gevonden.'];
+    }
+
+    $url = caldav_sanitize_url($connection['url'] ?? '');
+    if (!$url) {
+        caldav_record_fetch_error($slug, 'Ongeldige CalDAV-URL in de verbinding.');
+        return ['ok' => false, 'message' => 'De CalDAV-URL van "' . esc_html($slug) . '" is ongeldig.'];
+    }
+
+    $started = microtime(true);
+    $fetch = caldav_fetch_ical($url, sanitize_text_field($connection['user'] ?? ''), $connection['pass'] ?? '');
+    $duration = number_format_i18n(microtime(true) - $started, 1);
+
+    if (!$fetch['ok']) {
+        caldav_record_fetch_error($slug, $fetch['error']);
+        return [
+            'ok' => false,
+            'message' => '<strong>Test mislukt voor "' . esc_html($slug) . '"</strong> (na ' . $duration . ' s): '
+                       . esc_html($fetch['error'])
+                       . '<br>De kalender op de site toont zolang de laatst bekende agenda.',
+        ];
+    }
+
+    // Ruim venster, zodat de test niet faalt door een toevallig lege week.
+    $events = caldav_parse_events($fetch['ical'], ['limitdays' => 365, 'pastdays' => 0]);
+    caldav_clear_fetch_error($slug);
+    caldav_clear_all_cache();
+
+    $message = '<strong>Verbinding "' . esc_html($slug) . '" werkt.</strong> '
+             . 'HTTP ' . intval($fetch['http']) . ', ' . intval($fetch['items']) . ' agenda-items opgehaald in ' . $duration . ' s. ';
+
+    if (empty($events)) {
+        $message .= 'Let op: geen enkel event in de komende 365 dagen — de agenda zelf is leeg.';
+    } else {
+        usort($events, function ($a, $b) {
+            return $a['start'] <=> $b['start'];
+        });
+        $first = $events[0];
+        $message .= count($events) . ' event(s) in het komende jaar, eerstvolgende: '
+                  . esc_html($first['summary']) . ' op ' . esc_html($first['start']->format('d-m-Y H:i')) . '.';
+    }
+
+    $message .= '<br>De cache is geleegd, dus de site toont vanaf nu weer verse gegevens.';
+
+    return ['ok' => true, 'message' => $message];
 }
 
 function caldav_render_connections_tab() {
@@ -568,17 +702,43 @@ function caldav_render_connections_tab() {
                     <th>Slug</th>
                     <th>URL</th>
                     <th>Gebruiker</th>
-                    <th style="width:160px;">Acties</th>
+                    <th style="width:230px;">Status</th>
+                    <th style="width:220px;">Acties</th>
                 </tr>
             </thead>
             <tbody>
                 <?php foreach ($connections as $slug => $conn): ?>
+                    <?php
+                    $status = caldav_get_fetch_error($slug);
+                    $last_ok = caldav_get_lastgood_time($slug);
+                    ?>
                     <tr>
                         <td><?php echo esc_html($conn['name'] ?? '(naamloos)'); ?></td>
                         <td><code><?php echo esc_html($slug); ?></code></td>
                         <td><?php echo esc_html($conn['url'] ?? ''); ?></td>
                         <td><?php echo esc_html($conn['user'] ?? ''); ?></td>
                         <td>
+                            <?php if ($status): ?>
+                                <span style="color:#b32d2e;font-weight:600;">&#10007; Fout</span><br>
+                                <span style="color:#b32d2e;"><?php echo esc_html($status['message']); ?></span><br>
+                                <small>Al mis sinds <?php echo esc_html(human_time_diff((int) $status['since'], time())); ?>.</small>
+                                <?php if ($last_ok): ?>
+                                    <br><small>Toont de agenda van <?php echo esc_html(human_time_diff($last_ok, time())); ?> geleden.</small>
+                                <?php endif; ?>
+                            <?php elseif ($last_ok): ?>
+                                <span style="color:#207b3f;font-weight:600;">&#10003; OK</span><br>
+                                <small>Laatst opgehaald <?php echo esc_html(human_time_diff($last_ok, time())); ?> geleden.</small>
+                            <?php else: ?>
+                                <span style="color:#666;">Nog niet opgehaald.</span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <form method="post" style="display:inline;">
+                                <?php wp_nonce_field('caldav_test_connection', 'caldav_nonce'); ?>
+                                <input type="hidden" name="caldav_action" value="test_connection">
+                                <input type="hidden" name="slug" value="<?php echo esc_attr($slug); ?>">
+                                <button type="submit" class="button">Testen</button>
+                            </form>
                             <a href="<?php echo esc_url($base_url . '&edit=' . urlencode($slug)); ?>">Bewerken</a>
                             |
                             <form method="post" style="display:inline;" onsubmit="return confirm('Verbinding &quot;<?php echo esc_js($slug); ?>&quot; verwijderen?');">
@@ -869,6 +1029,107 @@ function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options) {
 // Publieke shortcode-handler met vangnet: vangt elke onverwachte fout
 // (Throwable) af zodat de pagina nooit wit wordt. Bij een fout proberen we
 // nog de laatst bekende goede agenda in het Nederlands te tonen.
+// === CALDAV FETCH (v2.6.4: gedeeld door de shortcode en de testknop) ===
+//
+// Doet één CalDAV REPORT en levert de ruwe iCalendar-data terug. Retourneert
+// altijd een array met:
+//   ok      — bool, of er bruikbare kalenderdata is opgehaald
+//   ical    — de (ontvouwen) iCalendar-tekst bij ok = true
+//   http    — de HTTP-statuscode (0 als er geen antwoord kwam)
+//   error   — korte technische reden voor de beheerder (leeg bij ok)
+//   visitor — vriendelijke NL melding voor bezoekers (leeg bij ok)
+//   items   — aantal gevonden calendar-data blokken
+function caldav_fetch_ical($url, $user, $pass) {
+    $result = ['ok' => false, 'ical' => '', 'http' => 0, 'error' => '', 'visitor' => '', 'items' => 0];
+
+    $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n" .
+           '<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">' . "\n" .
+           '    <D:prop>' . "\n" .
+           '        <D:getetag/>' . "\n" .
+           '        <C:calendar-data/>' . "\n" .
+           '    </D:prop>' . "\n" .
+           '    <C:filter>' . "\n" .
+           '        <C:comp-filter name="VCALENDAR">' . "\n" .
+           '            <C:comp-filter name="VEVENT"/>' . "\n" .
+           '        </C:comp-filter>' . "\n" .
+           '    </C:filter>' . "\n" .
+           '</C:calendar-query>';
+
+    $ch = curl_init();
+    if (!$ch) {
+        caldav_log_error('Failed to initialize cURL');
+        $result['error'] = 'Kon cURL niet initialiseren.';
+        $result['visitor'] = 'Kon verbinding niet initialiseren.';
+        return $result;
+    }
+
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST => 'REPORT',
+        CURLOPT_POSTFIELDS => $xml,
+        CURLOPT_HTTPHEADER => [
+            'Depth: 1',
+            'Content-Type: application/xml; charset=utf-8',
+            'User-Agent: WordPress CalDAV Plugin/' . CALDAV_PLUGIN_VERSION
+        ],
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_CONNECTTIMEOUT => 8,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2
+    ]);
+
+    if (!empty($user) || !empty($pass)) {
+        curl_setopt($ch, CURLOPT_USERPWD, $user . ':' . $pass);
+        curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+    }
+
+    $resp = curl_exec($ch);
+    $result['http'] = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curl_error = curl_error($ch);
+    curl_close($ch);
+
+    if ($resp === false || !empty($curl_error)) {
+        caldav_log_error('cURL error', ['error' => $curl_error, 'url' => $url]);
+        $result['error'] = 'Netwerkfout: ' . $curl_error;
+        $result['visitor'] = 'Netwerkfout bij ophalen kalender: ' . $curl_error;
+        return $result;
+    }
+
+    if ($result['http'] >= 400) {
+        caldav_log_error('HTTP error', ['code' => $result['http'], 'url' => $url]);
+        $error_messages = [
+            401 => 'Authenticatie gefaald. Controleer gebruikersnaam en wachtwoord.',
+            403 => 'Toegang geweigerd.',
+            404 => 'Kalender niet gevonden.',
+            500 => 'Server fout.'
+        ];
+        $msg = $error_messages[$result['http']] ?? 'HTTP fout ' . $result['http'];
+        $result['error'] = 'HTTP ' . $result['http'] . ' — ' . $msg;
+        $result['visitor'] = $msg;
+        return $result;
+    }
+
+    if (!preg_match_all('/<([a-zA-Z0-9]+:)?calendar-data[^>]*>(.*?)<\/([a-zA-Z0-9]+:)?calendar-data>/s', $resp, $matches)
+        || empty($matches[2])) {
+        caldav_log_error('No calendar data found', ['url' => $url]);
+        $result['error'] = 'Server antwoordde zonder kalenderdata (klopt de agenda-URL?).';
+        $result['visitor'] = 'Geen kalenderdata gevonden.';
+        return $result;
+    }
+
+    $ical_data = implode("\n", $matches[2]);
+
+    $result['ok'] = true;
+    $result['items'] = count($matches[2]);
+    // Ontvouw gevouwen iCalendar-regels (CRLF + spatie/tab, en kale LF).
+    $result['ical'] = preg_replace("/\r?\n[ \t]/", '', $ical_data);
+
+    return $result;
+}
+
 function caldav_calendar_shortcode($atts) {
     try {
         return caldav_calendar_shortcode_impl($atts);
@@ -876,6 +1137,7 @@ function caldav_calendar_shortcode($atts) {
         caldav_log_error('Shortcode exception', ['error' => $e->getMessage()]);
         $a = shortcode_atts(['connection' => ''], $atts, 'caldav_calendar');
         $slug = caldav_sanitize_slug($a['connection'] ?? '');
+        caldav_record_fetch_error($slug, 'PHP-fout tijdens opbouwen kalender: ' . $e->getMessage());
         $lastgood = caldav_get_lastgood($slug);
         if (!empty($lastgood)) {
             usort($lastgood, function ($x, $y) {
@@ -996,7 +1258,11 @@ function caldav_calendar_shortcode_impl($atts) {
     // Terugval bij een ophaal-/serverfout: toon de laatst bekende goede agenda
     // i.p.v. een lege/foutpagina. Pas als die er ook niet is, val terug op de
     // (op niet-NL onderdrukte) foutmelding.
-    $fallback = function ($dutch_error_html) use ($slug, $clean_options, $err) {
+    // $reason wordt (beknopt, zonder credentials) vastgelegd zodat de beheerder
+    // in wp-admin ziet dat de kalender op de terugval draait.
+    $fallback = function ($dutch_error_html, $reason = '') use ($slug, $clean_options, $err) {
+        caldav_record_fetch_error($slug, $reason !== '' ? $reason : 'Onbekende ophaalfout.');
+
         $lastgood = caldav_get_lastgood($slug);
         if (!empty($lastgood)) {
             usort($lastgood, function ($a, $b) {
@@ -1007,83 +1273,13 @@ function caldav_calendar_shortcode_impl($atts) {
         return $err($dutch_error_html);
     };
 
-    // XML REPORT body
-    $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n" .
-           '<C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">' . "\n" .
-           '    <D:prop>' . "\n" .
-           '        <D:getetag/>' . "\n" .
-           '        <C:calendar-data/>' . "\n" .
-           '    </D:prop>' . "\n" .
-           '    <C:filter>' . "\n" .
-           '        <C:comp-filter name="VCALENDAR">' . "\n" .
-           '            <C:comp-filter name="VEVENT"/>' . "\n" .
-           '        </C:comp-filter>' . "\n" .
-           '    </C:filter>' . "\n" .
-           '</C:calendar-query>';
+    $fetch = caldav_fetch_ical($url, $user, $pass);
 
-    // cURL request
-    $ch = curl_init();
-    if (!$ch) {
-        caldav_log_error('Failed to initialize cURL');
-        return $fallback('<div class="caldav-error">Kon verbinding niet initialiseren.</div>');
+    if (!$fetch['ok']) {
+        return $fallback('<div class="caldav-error">' . esc_html($fetch['visitor']) . '</div>', $fetch['error']);
     }
 
-    curl_setopt_array($ch, [
-        CURLOPT_URL => $url,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CUSTOMREQUEST => 'REPORT',
-        CURLOPT_POSTFIELDS => $xml,
-        CURLOPT_HTTPHEADER => [
-            'Depth: 1',
-            'Content-Type: application/xml; charset=utf-8',
-            'User-Agent: WordPress CalDAV Plugin/' . CALDAV_PLUGIN_VERSION
-        ],
-        CURLOPT_TIMEOUT => 15,
-        CURLOPT_CONNECTTIMEOUT => 8,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 3,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2
-    ]);
-
-    if (!empty($user) || !empty($pass)) {
-        curl_setopt($ch, CURLOPT_USERPWD, $user . ':' . $pass);
-        curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
-    }
-
-    $resp = curl_exec($ch);
-    $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curl_error = curl_error($ch);
-    curl_close($ch);
-
-    if ($resp === false || !empty($curl_error)) {
-        caldav_log_error('cURL error', ['error' => $curl_error, 'url' => $url]);
-        return $fallback('<div class="caldav-error">Netwerkfout bij ophalen kalender: ' . esc_html($curl_error) . '</div>');
-    }
-
-    if ($httpcode >= 400) {
-        caldav_log_error('HTTP error', ['code' => $httpcode, 'url' => $url]);
-        $error_messages = [
-            401 => 'Authenticatie gefaald. Controleer gebruikersnaam en wachtwoord.',
-            403 => 'Toegang geweigerd.',
-            404 => 'Kalender niet gevonden.',
-            500 => 'Server fout.'
-        ];
-        $error_msg = $error_messages[$httpcode] ?? 'HTTP fout ' . $httpcode;
-        return $fallback('<div class="caldav-error">' . esc_html($error_msg) . '</div>');
-    }
-
-    if (!preg_match_all('/<([a-zA-Z0-9]+:)?calendar-data[^>]*>(.*?)<\/([a-zA-Z0-9]+:)?calendar-data>/s', $resp, $matches)) {
-        caldav_log_error('No calendar data found', ['url' => $url]);
-        return $fallback('<div class="caldav-error">Geen kalenderdata gevonden.</div>');
-    }
-
-    if (empty($matches[2])) {
-        return $fallback('<div class="caldav-error">Geen iCalendar data ontvangen.</div>');
-    }
-
-    $ical_data = implode("\n", $matches[2]);
-    $ical = preg_replace("/\r\n[ \t]/", '', $ical_data);
+    $ical = $fetch['ical'];
 
     $parse_options = [
         'limitdays' => $limitdays,
@@ -1092,10 +1288,13 @@ function caldav_calendar_shortcode_impl($atts) {
     $events = caldav_parse_events($ical, $parse_options);
 
     if (empty($events)) {
+        // Ophalen slaagde wél — de agenda is simpelweg leeg binnen het venster.
+        caldav_clear_fetch_error($slug);
         $no_events = $lang === 'nl' ? 'Geen komende evenementen gevonden.' : 'No upcoming events found.';
         return '<div class="caldav-no-events">' . esc_html($no_events) . '</div>';
     }
 
+    caldav_clear_fetch_error($slug);
     caldav_cache_events($cache_key, $events);
 
     usort($events, function($a, $b) {
@@ -1504,6 +1703,60 @@ function caldav_show_activation_notice() {
     }
 }
 add_action('admin_notices', 'caldav_show_activation_notice');
+
+// === HEALTH NOTICE (v2.6.4) ===
+//
+// Waarschuw de beheerder wanneer een kalender op de terugval draait. Zonder
+// deze melding blijft een kapotte verbinding onzichtbaar: bezoekers zien een
+// keurige maar bevroren agenda en nieuwe afspraken verschijnen nooit.
+function caldav_health_notice() {
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+
+    // Niet dubbelop tonen: de Verbindingen-tab heeft al een statuskolom.
+    $screen = function_exists('get_current_screen') ? get_current_screen() : null;
+    if ($screen && $screen->id === 'settings_page_caldav-calendar') {
+        return;
+    }
+
+    $broken = [];
+    foreach (caldav_get_connections() as $slug => $conn) {
+        $status = caldav_get_fetch_error($slug);
+        if ($status) {
+            $broken[$slug] = $status;
+        }
+    }
+
+    if (empty($broken)) {
+        return;
+    }
+
+    $settings_url = admin_url('options-general.php?page=caldav-calendar&tab=connections');
+    ?>
+    <div class="notice notice-error">
+        <p><strong>Modern CalDAV Calendar: de agenda is niet bijgewerkt.</strong></p>
+        <ul style="margin-left:1.5em;list-style:disc;">
+            <?php foreach ($broken as $slug => $status): ?>
+                <?php $last_ok = caldav_get_lastgood_time($slug); ?>
+                <li>
+                    <code><?php echo esc_html($slug); ?></code>: <?php echo esc_html($status['message']); ?>
+                    <?php if (!empty($status['since'])): ?>
+                        (al <?php echo esc_html(human_time_diff((int) $status['since'], time())); ?> mis<?php
+                            if ($last_ok) {
+                                echo '; de site toont de agenda van ' . esc_html(human_time_diff($last_ok, time())) . ' geleden';
+                            }
+                        ?>)
+                    <?php endif; ?>
+                </li>
+            <?php endforeach; ?>
+        </ul>
+        <p>Bezoekers zien nu de laatst bekende agenda, dus nieuwe afspraken verschijnen niet.
+           <a href="<?php echo esc_url($settings_url); ?>">Verbinding testen en herstellen</a>.</p>
+    </div>
+    <?php
+}
+add_action('admin_notices', 'caldav_health_notice');
 
 // === STYLES ===
 

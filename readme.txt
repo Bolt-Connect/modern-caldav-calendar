@@ -4,7 +4,7 @@ Tags: caldav, calendar, agenda, ical, events
 Requires at least: 5.0
 Tested up to: 6.7
 Requires PHP: 7.4
-Stable tag: 2.6.3
+Stable tag: 2.6.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -84,6 +84,16 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 
 == Changelog ==
 
+= 2.6.4 =
+* Nieuw: knop "Testen" per verbinding — doet een echte CalDAV-aanroep en meldt direct of de URL werkt, met HTTP-code, aantal opgehaalde items, responstijd en de eerstvolgende afspraak
+* Nieuw: statuskolom in het verbindingenoverzicht (OK / Fout, met de foutmelding en hoe oud de getoonde agenda is)
+* Nieuw: waarschuwing in wp-admin zodra een kalender op de terugval draait — voorheen bleef een kapotte verbinding volledig onzichtbaar omdat bezoekers gewoon de laatst bekende agenda zagen
+* Een geslaagde test leegt de cache, zodat de site meteen weer verse gegevens toont
+* Fix: iCalendar-regels die met een kale LF gevouwen zijn worden nu ook correct ontvouwen (voorheen alleen CRLF)
+* Opruiming: het verwijderen van een verbinding laat geen verweesde terugval-/statusopties meer achter in wp_options
+* Intern: de CalDAV-aanroep zit in één gedeelde functie die de shortcode en de testknop allebei gebruiken
+* Header bijgewerkt naar "Tested up to: 7.0"
+
 = 2.6.3 =
 * Stabiliteit: geen witte pagina's meer — hele shortcode in een try/catch-vangnet, kortere timeouts (CalDAV 15s, DeepL 8s) zodat een trage server PHP niet laat crashen
 * Terugval op "laatst bekende goede agenda" bij een ophaal-/serverfout, zodat de kalender nooit leeg/wit wordt (per verbinding bewaard)
@@ -140,6 +150,9 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 * Initiële versie met ABSPATH-check en basisbeveiliging
 
 == Upgrade Notice ==
+
+= 2.6.4 =
+Aanrader na 2.6.3: die versie viel bij een storing stil terug op de laatst bekende agenda, waardoor een kapotte verbinding onopgemerkt bleef. 2.6.4 waarschuwt de beheerder en voegt een testknop per verbinding toe.
 
 = 2.6 =
 Nieuwe `lang`-parameter voor meertalige weergave. Vul optioneel een DeepL API-key in onder Instellingen om titel en beschrijving automatisch te laten vertalen.
