@@ -4,7 +4,7 @@ Tags: caldav, calendar, agenda, ical, events
 Requires at least: 5.0
 Tested up to: 6.7
 Requires PHP: 7.4
-Stable tag: 2.6.4
+Stable tag: 2.6.5
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -83,6 +83,12 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 4. Card-weergave met dark theme
 
 == Changelog ==
+
+= 2.6.5 =
+* Fix: eindtijden verdwenen bij servers die `DURATION` schrijven in plaats van `DTEND` (o.a. Stalwart). De duur wordt nu omgerekend naar een eindtijd (PT2H30M, P1DT2H, P2W enz.)
+* De testknop herkent nu een "calendar-home"-URL (HTTP 405 op REPORT) en zoekt via PROPFIND zelf de onderliggende agenda's op, met de exacte URL die je moet invullen
+* Per gevonden agenda wordt het aantal items getoond, zodat je de juiste kiest — een agenda kan "Test" heten en leeg zijn terwijl de naamloze ernaast de echte afspraken bevat
+* Deze twee samen verklaren een agenda die bevroren lijkt: de ingevulde URL wees naar de map met agenda's in plaats van naar een agenda
 
 = 2.6.4 =
 * Nieuw: knop "Testen" per verbinding — doet een echte CalDAV-aanroep en meldt direct of de URL werkt, met HTTP-code, aantal opgehaalde items, responstijd en de eerstvolgende afspraak

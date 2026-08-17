@@ -2,7 +2,7 @@
 /*
 Plugin Name: Modern CalDAV Calendar
 Description: Moderne CalDAV kalender plugin met styling, herhalingen en veiligheid. Credentials beheerd via admin-instellingen. Optionele meertaligheid via DeepL.
-Version: 2.6.4
+Version: 2.6.5
 Author: Bolt Connect
 Requires at least: 5.0
 Tested up to: 7.0
@@ -17,7 +17,7 @@ if (!defined('ABSPATH')) {
     exit('Direct access not permitted.');
 }
 
-define('CALDAV_PLUGIN_VERSION', '2.6.4');
+define('CALDAV_PLUGIN_VERSION', '2.6.5');
 define('CALDAV_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('CALDAV_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -554,6 +554,87 @@ function caldav_handle_admin_actions() {
     }
 }
 
+// Zoek onder een CalDAV-URL naar échte agenda-collecties (PROPFIND, Depth 1).
+// Nodig omdat een "calendar-home"-URL er identiek uitziet maar geen agenda is:
+// daar geeft een calendar-query REPORT netjes HTTP 405. Retourneert een lijst
+// van ['url' => ..., 'name' => ...].
+function caldav_discover_calendars($url, $user, $pass) {
+    $body = '<?xml version="1.0" encoding="UTF-8"?>' . "\n" .
+            '<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">' . "\n" .
+            '  <D:prop><D:resourcetype/><D:displayname/></D:prop>' . "\n" .
+            '</D:propfind>';
+
+    $ch = curl_init();
+    if (!$ch) {
+        return [];
+    }
+
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST => 'PROPFIND',
+        CURLOPT_POSTFIELDS => $body,
+        CURLOPT_HTTPHEADER => [
+            'Depth: 1',
+            'Content-Type: application/xml; charset=utf-8',
+            'User-Agent: WordPress CalDAV Plugin/' . CALDAV_PLUGIN_VERSION
+        ],
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_CONNECTTIMEOUT => 8,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2
+    ]);
+
+    if (!empty($user) || !empty($pass)) {
+        curl_setopt($ch, CURLOPT_USERPWD, $user . ':' . $pass);
+        curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+    }
+
+    $resp = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($resp === false || $code >= 400) {
+        return [];
+    }
+
+    $parts = wp_parse_url($url);
+    if (empty($parts['scheme']) || empty($parts['host'])) {
+        return [];
+    }
+    $origin = $parts['scheme'] . '://' . $parts['host'] . (!empty($parts['port']) ? ':' . $parts['port'] : '');
+
+    $found = [];
+    // Namespace-prefixen verschillen per server, dus die houden we vrij.
+    // De (?:\s[^>]*)? voorkomt dat <responsedescription> als <response> telt.
+    if (preg_match_all('/<[a-z0-9]*:?response(?:\s[^>]*)?>(.*?)<\/[a-z0-9]*:?response>/is', $resp, $responses)) {
+        foreach ($responses[1] as $block) {
+            // Alleen collecties die zichzelf als calendar aanmerken.
+            if (!preg_match('/<[a-z0-9]*:?calendar\s*\/>/i', $block)) {
+                continue;
+            }
+            if (!preg_match('/<[a-z0-9]*:?href[^>]*>(.*?)<\/[a-z0-9]*:?href>/is', $block, $h)) {
+                continue;
+            }
+
+            $href = trim(html_entity_decode($h[1], ENT_QUOTES, 'UTF-8'));
+            $name = '';
+            if (preg_match('/<[a-z0-9]*:?displayname[^>]*>(.*?)<\/[a-z0-9]*:?displayname>/is', $block, $d)) {
+                $name = trim(html_entity_decode($d[1], ENT_QUOTES, 'UTF-8'));
+            }
+
+            $found[] = [
+                'url'  => (strpos($href, 'http') === 0) ? $href : $origin . $href,
+                'name' => $name !== '' ? $name : '(naamloos)',
+            ];
+        }
+    }
+
+    return $found;
+}
+
 // Voer een live test uit op één verbinding: haalt de agenda echt op, telt de
 // events en werkt de statusregistratie bij. Bij succes wordt de cache geleegd,
 // zodat de site meteen de verse agenda toont in plaats van de terugval.
@@ -579,12 +660,41 @@ function caldav_run_connection_test($slug) {
 
     if (!$fetch['ok']) {
         caldav_record_fetch_error($slug, $fetch['error']);
-        return [
-            'ok' => false,
-            'message' => '<strong>Test mislukt voor "' . esc_html($slug) . '"</strong> (na ' . $duration . ' s): '
-                       . esc_html($fetch['error'])
-                       . '<br>De kalender op de site toont zolang de laatst bekende agenda.',
-        ];
+
+        $message = '<strong>Test mislukt voor "' . esc_html($slug) . '"</strong> (na ' . $duration . ' s): '
+                 . esc_html($fetch['error']);
+
+        // Veelvoorkomende oorzaak: de ingevulde URL is de "calendar-home" en
+        // niet de agenda zelf. Zoek dan meteen de bruikbare agenda-URL's op.
+        $conn_user = sanitize_text_field($connection['user'] ?? '');
+        $conn_pass = $connection['pass'] ?? '';
+        $calendars = caldav_discover_calendars($url, $conn_user, $conn_pass);
+
+        if (!empty($calendars)) {
+            $message .= '<br><br><strong>Deze URL is geen agenda maar een map met agenda\'s.</strong> '
+                      . 'Vul in plaats daarvan een van deze URL\'s in bij de verbinding:<br>';
+
+            // Tel het aantal items per agenda. Een naam zegt vaak te weinig —
+            // een agenda kan "Test" heten en leeg zijn terwijl de naamloze
+            // ernaast de echte afspraken bevat. Max 5 om de test kort te houden.
+            $probed = 0;
+            foreach ($calendars as $cal) {
+                $label = '';
+                if ($probed < 5) {
+                    $probed++;
+                    $sub = caldav_fetch_ical($cal['url'], $conn_user, $conn_pass);
+                    $label = $sub['ok']
+                        ? ' — <strong>' . intval($sub['items']) . ' item(s)</strong>'
+                        : ' — <em>niet leesbaar</em>';
+                }
+                $message .= '&bull; <em>' . esc_html($cal['name']) . '</em>' . $label
+                          . '<br><code>' . esc_html($cal['url']) . '</code><br>';
+            }
+        } else {
+            $message .= '<br>De kalender op de site toont zolang de laatst bekende agenda.';
+        }
+
+        return ['ok' => false, 'message' => $message];
     }
 
     // Ruim venster, zodat de test niet faalt door een toevallig lege week.
@@ -893,6 +1003,31 @@ function caldav_render_help_tab() {
         <p>Vanaf v2.5 worden credentials uitsluitend in admin-instellingen opgeslagen, niet meer in shortcodes. Dit voorkomt dat wachtwoorden in post-content/database-backups zichtbaar worden.</p>
     </div>
     <?php
+}
+
+// Reken een iCalendar DURATION (ISO 8601, bijv. PT2H30M, P1DT2H, P2W) om naar
+// een eindtijd. Retourneert null bij een onleesbare waarde, zodat de eindtijd
+// dan simpelweg wegvalt in plaats van een fout te veroorzaken.
+function caldav_apply_duration($dtstart, $duration) {
+    if (!$dtstart || $duration === '') {
+        return null;
+    }
+
+    $negative = (strpos($duration, '-') === 0);
+    $spec = ltrim($duration, '+-');
+
+    if (!preg_match('/^P(?:\d+W|(?:\d+Y)?(?:\d+M)?(?:\d+D)?(?:T(?:\d+H)?(?:\d+M)?(?:\d+S)?)?)$/', $spec)) {
+        return null;
+    }
+
+    try {
+        $interval = new DateInterval($spec);
+    } catch (\Exception $e) {
+        caldav_log_error('Onleesbare DURATION', ['duration' => $duration]);
+        return null;
+    }
+
+    return $negative ? $dtstart->sub($interval) : $dtstart->add($interval);
 }
 
 // === RECURRING EVENTS ===
@@ -1374,6 +1509,13 @@ function caldav_parse_events($ical, $options) {
 
         if (!$dtstart) {
             continue;
+        }
+
+        // Een VEVENT mag DTEND óf DURATION hebben, nooit allebei. Diverse
+        // servers (o.a. Stalwart) schrijven consequent DURATION; zonder deze
+        // omrekening zou de eindtijd overal wegvallen.
+        if (!$dtend && preg_match('/DURATION:([^\r\n]+)(\r\n|$)/', $vevent, $m)) {
+            $dtend = caldav_apply_duration($dtstart, trim($m[1]));
         }
 
         $is_all_day = preg_match('/^\d{8}$/', $start_raw);
