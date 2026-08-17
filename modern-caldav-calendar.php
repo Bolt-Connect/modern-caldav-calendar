@@ -2,7 +2,7 @@
 /*
 Plugin Name: Modern CalDAV Calendar
 Description: Moderne CalDAV kalender plugin met styling, herhalingen en veiligheid. Credentials beheerd via admin-instellingen. Optionele meertaligheid via DeepL.
-Version: 2.6.5
+Version: 2.6.6
 Author: Bolt Connect
 Requires at least: 5.0
 Tested up to: 7.0
@@ -17,7 +17,7 @@ if (!defined('ABSPATH')) {
     exit('Direct access not permitted.');
 }
 
-define('CALDAV_PLUGIN_VERSION', '2.6.5');
+define('CALDAV_PLUGIN_VERSION', '2.6.6');
 define('CALDAV_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('CALDAV_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -191,6 +191,9 @@ function caldav_record_fetch_error($slug, $message) {
         return;
     }
 
+    // Deze tekst wordt in wp-admin getoond; nooit inloggegevens tonen.
+    $message = caldav_scrub_url($message);
+
     $existing = get_option('caldav_status_' . $slug, null);
     if (is_array($existing)
         && ($existing['message'] ?? '') === $message
@@ -226,10 +229,21 @@ function caldav_delete_connection_state($slug) {
     delete_option('caldav_status_' . $slug);
 }
 
+// Haal eventuele inloggegevens uit een URL (https://user:pass@host/... ) zodat
+// ze niet in het debug-log of in een beheerdersmelding terechtkomen.
+function caldav_scrub_url($url) {
+    return preg_replace('#(https?://)[^/@\s]*@#i', '$1', (string) $url);
+}
+
 function caldav_log_error($message, $context = []) {
     if (defined('WP_DEBUG') && WP_DEBUG && defined('WP_DEBUG_LOG') && WP_DEBUG_LOG) {
-        $log_message = 'CalDAV Calendar: ' . $message;
+        $log_message = 'CalDAV Calendar: ' . caldav_scrub_url($message);
         if (!empty($context)) {
+            foreach ($context as $key => $value) {
+                if (is_string($value)) {
+                    $context[$key] = caldav_scrub_url($value);
+                }
+            }
             $log_message .= ' Context: ' . json_encode($context);
         }
         error_log($log_message);
@@ -475,35 +489,47 @@ function caldav_admin_page() {
     <?php
 }
 
+// WordPress voegt slashes toe aan $_POST. Zonder wp_unslash() raakt een
+// wachtwoord met een aanhalingsteken of backslash beschadigd bij opslaan.
+function caldav_post_value($key) {
+    return isset($_POST[$key]) ? wp_unslash($_POST[$key]) : '';
+}
+
+function caldav_verify_nonce($action) {
+    return (bool) wp_verify_nonce(sanitize_text_field(caldav_post_value('caldav_nonce')), $action);
+}
+
 function caldav_handle_admin_actions() {
+    $action = sanitize_text_field(caldav_post_value('caldav_action'));
+
     // Cache settings update
-    if (isset($_POST['caldav_action']) && $_POST['caldav_action'] === 'update_settings'
-        && wp_verify_nonce($_POST['caldav_nonce'] ?? '', 'caldav_update_settings')) {
+    if ($action === 'update_settings' && caldav_verify_nonce('caldav_update_settings')) {
         $cache_enabled = isset($_POST['cache_enabled']);
-        $cache_duration = max(60, min(3600, intval($_POST['cache_duration'] ?? 300)));
-        $deepl_key = sanitize_text_field($_POST['deepl_api_key'] ?? '');
+        $cache_duration = max(60, min(3600, intval(caldav_post_value('cache_duration') ?: 300)));
+        $deepl_key = sanitize_text_field(caldav_post_value('deepl_api_key'));
         update_option('caldav_cache_enabled', $cache_enabled);
         update_option('caldav_cache_duration', $cache_duration);
-        update_option('caldav_deepl_api_key', $deepl_key);
+        // Leeg laten betekent: huidige sleutel behouden (het veld toont hem niet).
+        if ($deepl_key !== '') {
+            update_option('caldav_deepl_api_key', $deepl_key);
+        }
         add_settings_error('caldav', 'saved', 'Instellingen opgeslagen.', 'updated');
     }
 
     // Clear cache
-    if (isset($_POST['caldav_action']) && $_POST['caldav_action'] === 'clear_cache'
-        && wp_verify_nonce($_POST['caldav_nonce'] ?? '', 'caldav_clear_cache')) {
+    if ($action === 'clear_cache' && caldav_verify_nonce('caldav_clear_cache')) {
         caldav_clear_all_cache();
         add_settings_error('caldav', 'cache_cleared', 'Cache geleegd.', 'updated');
     }
 
     // Save connection (add or edit)
-    if (isset($_POST['caldav_action']) && $_POST['caldav_action'] === 'save_connection'
-        && wp_verify_nonce($_POST['caldav_nonce'] ?? '', 'caldav_save_connection')) {
-        $original_slug = caldav_sanitize_slug($_POST['original_slug'] ?? '');
-        $slug = caldav_sanitize_slug($_POST['slug'] ?? '');
-        $name = sanitize_text_field($_POST['name'] ?? '');
-        $url = caldav_sanitize_url($_POST['url'] ?? '');
-        $user = sanitize_text_field($_POST['user'] ?? '');
-        $pass = $_POST['pass'] ?? '';
+    if ($action === 'save_connection' && caldav_verify_nonce('caldav_save_connection')) {
+        $original_slug = caldav_sanitize_slug(caldav_post_value('original_slug'));
+        $slug = caldav_sanitize_slug(caldav_post_value('slug'));
+        $name = sanitize_text_field(caldav_post_value('name'));
+        $url = caldav_sanitize_url(caldav_post_value('url'));
+        $user = sanitize_text_field(caldav_post_value('user'));
+        $pass = caldav_post_value('pass');
 
         if (empty($slug) || empty($name) || empty($url)) {
             add_settings_error('caldav', 'invalid', 'Naam, slug en URL zijn verplicht. URL moet geldig zijn.', 'error');
@@ -536,17 +562,15 @@ function caldav_handle_admin_actions() {
     }
 
     // Test connection (v2.6.4)
-    if (isset($_POST['caldav_action']) && $_POST['caldav_action'] === 'test_connection'
-        && wp_verify_nonce($_POST['caldav_nonce'] ?? '', 'caldav_test_connection')) {
-        $slug = caldav_sanitize_slug($_POST['slug'] ?? '');
+    if ($action === 'test_connection' && caldav_verify_nonce('caldav_test_connection')) {
+        $slug = caldav_sanitize_slug(caldav_post_value('slug'));
         $test = caldav_run_connection_test($slug);
         add_settings_error('caldav', 'test', $test['message'], $test['ok'] ? 'updated' : 'error');
     }
 
     // Delete connection
-    if (isset($_POST['caldav_action']) && $_POST['caldav_action'] === 'delete_connection'
-        && wp_verify_nonce($_POST['caldav_nonce'] ?? '', 'caldav_delete_connection')) {
-        $slug = caldav_sanitize_slug($_POST['slug'] ?? '');
+    if ($action === 'delete_connection' && caldav_verify_nonce('caldav_delete_connection')) {
+        $slug = caldav_sanitize_slug(caldav_post_value('slug'));
         if (!empty($slug)) {
             caldav_delete_connection($slug);
             add_settings_error('caldav', 'deleted', 'Verbinding "' . esc_html($slug) . '" verwijderd.', 'updated');
@@ -620,13 +644,35 @@ function caldav_discover_calendars($url, $user, $pass) {
             }
 
             $href = trim(html_entity_decode($h[1], ENT_QUOTES, 'UTF-8'));
+            if ($href === '') {
+                continue;
+            }
+
+            // De href komt van de server. Een absolute href die naar een ándere
+            // host wijst negeren we: die zouden we anders ophalen en (bij één
+            // gevonden agenda) zelfs opslaan, wat een kwaadwillende of gekaapte
+            // CalDAV-server zou kunnen misbruiken om de site interne adressen
+            // te laten benaderen.
+            if (preg_match('#^https?://#i', $href)) {
+                if (stripos($href, $origin . '/') !== 0 && strcasecmp($href, $origin) !== 0) {
+                    caldav_log_error('Discovery: href op andere host genegeerd', ['href' => $href]);
+                    continue;
+                }
+                $full = $href;
+            } else {
+                if (strpos($href, '/') !== 0) {
+                    continue; // geen pad dat we betrouwbaar kunnen samenstellen
+                }
+                $full = $origin . $href;
+            }
+
             $name = '';
             if (preg_match('/<[a-z0-9]*:?displayname[^>]*>(.*?)<\/[a-z0-9]*:?displayname>/is', $block, $d)) {
                 $name = trim(html_entity_decode($d[1], ENT_QUOTES, 'UTF-8'));
             }
 
             $found[] = [
-                'url'  => (strpos($href, 'http') === 0) ? $href : $origin . $href,
+                'url'  => $full,
                 'name' => $name !== '' ? $name : '(naamloos)',
             ];
         }
@@ -654,55 +700,89 @@ function caldav_run_connection_test($slug) {
         return ['ok' => false, 'message' => 'De CalDAV-URL van "' . esc_html($slug) . '" is ongeldig.'];
     }
 
+    $conn_user = sanitize_text_field($connection['user'] ?? '');
+    $conn_pass = $connection['pass'] ?? '';
+
     $started = microtime(true);
-    $fetch = caldav_fetch_ical($url, sanitize_text_field($connection['user'] ?? ''), $connection['pass'] ?? '');
+    $fetch = caldav_fetch_ical($url, $conn_user, $conn_pass);
     $duration = number_format_i18n(microtime(true) - $started, 1);
 
-    if (!$fetch['ok']) {
-        caldav_record_fetch_error($slug, $fetch['error']);
-
-        $message = '<strong>Test mislukt voor "' . esc_html($slug) . '"</strong> (na ' . $duration . ' s): '
-                 . esc_html($fetch['error']);
-
-        // Veelvoorkomende oorzaak: de ingevulde URL is de "calendar-home" en
-        // niet de agenda zelf. Zoek dan meteen de bruikbare agenda-URL's op.
-        $conn_user = sanitize_text_field($connection['user'] ?? '');
-        $conn_pass = $connection['pass'] ?? '';
-        $calendars = caldav_discover_calendars($url, $conn_user, $conn_pass);
-
-        if (!empty($calendars)) {
-            $message .= '<br><br><strong>Deze URL is geen agenda maar een map met agenda\'s.</strong> '
-                      . 'Vul in plaats daarvan een van deze URL\'s in bij de verbinding:<br>';
-
-            // Tel het aantal items per agenda. Een naam zegt vaak te weinig —
-            // een agenda kan "Test" heten en leeg zijn terwijl de naamloze
-            // ernaast de echte afspraken bevat. Max 5 om de test kort te houden.
-            $probed = 0;
-            foreach ($calendars as $cal) {
-                $label = '';
-                if ($probed < 5) {
-                    $probed++;
-                    $sub = caldav_fetch_ical($cal['url'], $conn_user, $conn_pass);
-                    $label = $sub['ok']
-                        ? ' — <strong>' . intval($sub['items']) . ' item(s)</strong>'
-                        : ' — <em>niet leesbaar</em>';
-                }
-                $message .= '&bull; <em>' . esc_html($cal['name']) . '</em>' . $label
-                          . '<br><code>' . esc_html($cal['url']) . '</code><br>';
-            }
-        } else {
-            $message .= '<br>De kalender op de site toont zolang de laatst bekende agenda.';
-        }
-
-        return ['ok' => false, 'message' => $message];
+    if ($fetch['ok']) {
+        caldav_clear_fetch_error($slug);
+        caldav_clear_all_cache();
+        return ['ok' => true, 'message' => caldav_test_success_message($slug, $fetch, $duration)];
     }
 
+    // Veelvoorkomende oorzaak: de ingevulde URL is de "calendar-home" en niet
+    // de agenda zelf. Zoek dan meteen de bruikbare agenda-URL's op.
+    $calendars = caldav_discover_calendars($url, $conn_user, $conn_pass);
+
+    // Is er precies één agenda, dan is er niets te kiezen: die vullen we zelf
+    // in. Alleen als hij daadwerkelijk werkt — anders zouden we een verbinding
+    // overschrijven met een URL die het ook niet doet.
+    if (count($calendars) === 1) {
+        $new_url = caldav_sanitize_url($calendars[0]['url']);
+
+        if ($new_url && $new_url !== $url) {
+            $retry_started = microtime(true);
+            $retry = caldav_fetch_ical($new_url, $conn_user, $conn_pass);
+            $retry_duration = number_format_i18n(microtime(true) - $retry_started, 1);
+
+            if ($retry['ok']) {
+                $connection['url'] = $new_url;
+                caldav_save_connection($slug, $connection);
+                caldav_clear_fetch_error($slug);
+                caldav_clear_all_cache();
+
+                $prefix = '<strong>URL automatisch gecorrigeerd.</strong> De ingevulde URL was een map met agenda\'s; '
+                        . 'er bleek precies één agenda in te zitten'
+                        . ($calendars[0]['name'] !== '(naamloos)' ? ' ("' . esc_html($calendars[0]['name']) . '")' : '')
+                        . ', en die is nu opgeslagen bij deze verbinding:<br><code>' . esc_html($new_url) . '</code><br><br>';
+
+                return ['ok' => true, 'message' => caldav_test_success_message($slug, $retry, $retry_duration, $prefix)];
+            }
+        }
+    }
+
+    caldav_record_fetch_error($slug, $fetch['error']);
+
+    $message = '<strong>Test mislukt voor "' . esc_html($slug) . '"</strong> (na ' . $duration . ' s): '
+             . esc_html($fetch['error']);
+
+    if (!empty($calendars)) {
+        $message .= '<br><br><strong>Deze URL is geen agenda maar een map met agenda\'s.</strong> '
+                  . 'Vul in plaats daarvan een van deze URL\'s in bij de verbinding:<br>';
+
+        // Tel het aantal items per agenda. Een naam zegt vaak te weinig — een
+        // agenda kan "Test" heten en leeg zijn terwijl de naamloze ernaast de
+        // echte afspraken bevat. Max 5 om de test kort te houden.
+        $probed = 0;
+        foreach ($calendars as $cal) {
+            $label = '';
+            if ($probed < 5) {
+                $probed++;
+                $sub = caldav_fetch_ical($cal['url'], $conn_user, $conn_pass);
+                $label = $sub['ok']
+                    ? ' — <strong>' . intval($sub['items']) . ' item(s)</strong>'
+                    : ' — <em>niet leesbaar</em>';
+            }
+            $message .= '&bull; <em>' . esc_html($cal['name']) . '</em>' . $label
+                      . '<br><code>' . esc_html($cal['url']) . '</code><br>';
+        }
+    } else {
+        $message .= '<br>De kalender op de site toont zolang de laatst bekende agenda.';
+    }
+
+    return ['ok' => false, 'message' => $message];
+}
+
+// Bouw de meldtekst van een geslaagde test. $prefix wordt ervoor gezet wanneer
+// de URL onderweg automatisch is gecorrigeerd.
+function caldav_test_success_message($slug, $fetch, $duration, $prefix = '') {
     // Ruim venster, zodat de test niet faalt door een toevallig lege week.
     $events = caldav_parse_events($fetch['ical'], ['limitdays' => 365, 'pastdays' => 0]);
-    caldav_clear_fetch_error($slug);
-    caldav_clear_all_cache();
 
-    $message = '<strong>Verbinding "' . esc_html($slug) . '" werkt.</strong> '
+    $message = $prefix . '<strong>Verbinding "' . esc_html($slug) . '" werkt.</strong> '
              . 'HTTP ' . intval($fetch['http']) . ', ' . intval($fetch['items']) . ' agenda-items opgehaald in ' . $duration . ' s. ';
 
     if (empty($events)) {
@@ -718,7 +798,7 @@ function caldav_run_connection_test($slug) {
 
     $message .= '<br>De cache is geleegd, dus de site toont vanaf nu weer verse gegevens.';
 
-    return ['ok' => true, 'message' => $message];
+    return $message;
 }
 
 function caldav_render_connections_tab() {
@@ -831,7 +911,9 @@ function caldav_render_connections_tab() {
                             <?php if ($status): ?>
                                 <span style="color:#b32d2e;font-weight:600;">&#10007; Fout</span><br>
                                 <span style="color:#b32d2e;"><?php echo esc_html($status['message']); ?></span><br>
-                                <small>Al mis sinds <?php echo esc_html(human_time_diff((int) $status['since'], time())); ?>.</small>
+                                <?php if (!empty($status['since'])): ?>
+                                    <small>Al mis sinds <?php echo esc_html(human_time_diff((int) $status['since'], time())); ?>.</small>
+                                <?php endif; ?>
                                 <?php if ($last_ok): ?>
                                     <br><small>Toont de agenda van <?php echo esc_html(human_time_diff($last_ok, time())); ?> geleden.</small>
                                 <?php endif; ?>
@@ -884,7 +966,8 @@ function caldav_render_settings_tab() {
                 <th scope="row"><label for="caldav-deepl-key">DeepL API-key</label></th>
                 <td>
                     <input id="caldav-deepl-key" type="password" name="deepl_api_key" class="regular-text"
-                           autocomplete="off" value="<?php echo esc_attr($deepl_key); ?>">
+                           autocomplete="off" value=""
+                           placeholder="<?php echo $deepl_key !== '' ? 'Sleutel is ingesteld — laat leeg om te behouden' : 'Nog geen sleutel ingesteld'; ?>">
                     <p class="description">
                         Optioneel. Nodig voor automatische vertaling van titel en beschrijving
                         bij <code>lang="en"</code> (of een andere taal) in de shortcode. Zonder key
@@ -1030,9 +1113,62 @@ function caldav_apply_duration($dtstart, $duration) {
     return $negative ? $dtstart->sub($interval) : $dtstart->add($interval);
 }
 
+// === UITZONDERINGEN OP HERHALINGEN ===
+//
+// Wie in zijn agenda één keer van een herhalende afspraak afwijkt, krijgt van
+// de client twee mogelijke uitkomsten:
+//   * "deze keer verwijderen"  -> een EXDATE-regel in de reeks
+//   * "deze keer wijzigen"     -> een los VEVENT met dezelfde UID en een
+//                                 RECURRENCE-ID die de oorspronkelijke datum
+//                                 aanwijst
+// Zonder ondersteuning hiervoor toont de site een geschrapte keer alsnog, of
+// twee keer dezelfde afspraak. We vergelijken op datum (Ymd): dat is bestand
+// tegen verschillen in tijdzone-notatie tussen servers, en binnen één reeks
+// valt er per dag hoogstens één keer af.
+
+function caldav_ical_date_key($value) {
+    $value = trim($value);
+    return (strlen($value) >= 8 && ctype_digit(substr($value, 0, 8))) ? substr($value, 0, 8) : '';
+}
+
+// Alle EXDATE-datums uit één VEVENT. Meerdere EXDATE-regels én meerdere
+// komma-gescheiden waarden per regel worden ondersteund.
+function caldav_collect_exdates($vevent) {
+    $dates = [];
+    if (preg_match_all('/^EXDATE[^:\r\n]*:([^\r\n]+)/m', $vevent, $matches)) {
+        foreach ($matches[1] as $line) {
+            foreach (explode(',', $line) as $value) {
+                $key = caldav_ical_date_key($value);
+                if ($key !== '') {
+                    $dates[$key] = true;
+                }
+            }
+        }
+    }
+    return $dates;
+}
+
+// Bouw een overzicht van gewijzigde losse keren: UID => [Ymd => true].
+function caldav_collect_recurrence_overrides($raw_vevents) {
+    $overrides = [];
+    foreach ($raw_vevents as $vevent) {
+        if (!preg_match('/^RECURRENCE-ID[^:\r\n]*:([^\r\n]+)/m', $vevent, $r)) {
+            continue;
+        }
+        if (!preg_match('/^UID:([^\r\n]+)/m', $vevent, $u)) {
+            continue;
+        }
+        $key = caldav_ical_date_key($r[1]);
+        if ($key !== '') {
+            $overrides[trim($u[1])][$key] = true;
+        }
+    }
+    return $overrides;
+}
+
 // === RECURRING EVENTS ===
 
-function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options) {
+function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options, $excluded = []) {
     if (!preg_match('/RRULE:(.*?)(\r\n|$)/s', $vevent, $m)) {
         return null;
     }
@@ -1079,84 +1215,212 @@ function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options) {
         }
     }
 
+    $bysetpos = caldav_rrule_numbers($rrule['BYSETPOS'] ?? null);
+    $bymonth = caldav_rrule_numbers($rrule['BYMONTH'] ?? null);
+    $byday_parts = caldav_parse_byday($byday);
+    $bymonthday_parts = caldav_rrule_numbers($bymonthday);
+
+    // Duur van het origineel; elke keer krijgt dezelfde lengte.
+    $duration = ($dtend && $dtend > $dtstart) ? $dtstart->diff($dtend) : null;
+
     $expanded_events = array();
-    $current = $dtstart;
-    $generated = 0;
-    $max_iterations = 10000;
-    $iterations = 0;
+    $emitted = 0;   // telt vanaf het begin van de reeks, ook buiten het venster
+    $stop = false;
 
-    $day_map = array(
-        'MO' => 'Monday', 'TU' => 'Tuesday', 'WE' => 'Wednesday',
-        'TH' => 'Thursday', 'FR' => 'Friday', 'SA' => 'Saturday', 'SU' => 'Sunday'
-    );
-
-    while ($iterations < $max_iterations && $current <= $end_for_expansion) {
-        $iterations++;
-
-        if ($count > 0 && $generated >= $count) {
-            break;
+    // Voeg één keer toe. Geeft false terug zodra de reeks klaar is (COUNT
+    // bereikt of voorbij de einddatum), zodat de lus kan stoppen.
+    $emit = function (DateTimeImmutable $moment) use (
+        &$expanded_events, &$emitted, $count, $dtstart, $pastLimit,
+        $end_for_expansion, $excluded, $duration
+    ) {
+        if ($moment < $dtstart) {
+            return true; // vóór de reeks begon
+        }
+        if ($moment > $end_for_expansion) {
+            return false;
         }
 
-        $include_event = true;
+        // COUNT telt élke keer van de reeks, ook de keren die buiten het
+        // getoonde venster vallen. Anders zou een reeks met COUNT=10 die vorig
+        // jaar begon er vandaag alsnog tien tonen.
+        $emitted++;
 
-        if ($byday && in_array($freq, ['WEEKLY', 'MONTHLY', 'YEARLY'])) {
-            $include_event = false;
-            $current_day = $current->format('l');
-            foreach (explode(',', $byday) as $bd) {
-                $bd = strtoupper(trim($bd));
-                if (isset($day_map[$bd]) && $day_map[$bd] === $current_day) {
-                    $include_event = true;
+        $skip = !empty($excluded) && isset($excluded[$moment->format('Ymd')]);
+
+        if (!$skip && $moment >= $pastLimit) {
+            $expanded_events[] = array(
+                'start' => $moment,
+                'end'   => $duration ? $moment->add($duration) : null,
+            );
+        }
+
+        return !($count > 0 && $emitted >= $count);
+    };
+
+    $guard = 0;
+
+    if ($freq === 'DAILY') {
+        for ($d = $dtstart; $d <= $end_for_expansion && $guard++ < 10000; $d = $d->add(new DateInterval('P' . $interval . 'D'))) {
+            if (!$emit($d)) {
+                break;
+            }
+        }
+    } elseif ($freq === 'WEEKLY') {
+        // Per week alle gevraagde weekdagen aflopen. De oude opzet sprong
+        // telkens een hele week vooruit vanaf DTSTART en filterde daarna op
+        // weekdag, waardoor bij BYDAY=MO,WE,FR alleen de maandagen overbleven.
+        $days = !empty($byday_parts)
+            ? array_column($byday_parts, 'day')
+            : array((int) $dtstart->format('N'));
+
+        // Bewust niet modify('monday this week'): die zet de tijd op 00:00 en
+        // zou de aanvangstijd van de afspraak wissen. Aftrekken behoudt hem.
+        $week_start = $dtstart->sub(new DateInterval('P' . ((int) $dtstart->format('N') - 1) . 'D'));
+
+        while ($week_start <= $end_for_expansion && $guard++ < 5000) {
+            for ($offset = 0; $offset < 7; $offset++) {
+                $moment = $week_start->add(new DateInterval('P' . $offset . 'D'));
+                if (!in_array((int) $moment->format('N'), $days, true)) {
+                    continue;
+                }
+                if (!$emit($moment)) {
+                    $stop = true;
                     break;
                 }
             }
+            if ($stop) {
+                break;
+            }
+            $week_start = $week_start->add(new DateInterval('P' . (7 * $interval) . 'D'));
         }
+    } elseif ($freq === 'MONTHLY' || $freq === 'YEARLY') {
+        $step = ($freq === 'MONTHLY') ? $interval : $interval * 12;
+        $cursor = $dtstart->setDate((int) $dtstart->format('Y'), (int) $dtstart->format('n'), 1);
 
-        if ($bymonthday && in_array($freq, ['MONTHLY', 'YEARLY'])) {
-            $include_event = false;
-            $current_monthday = intval($current->format('j'));
-            foreach (explode(',', $bymonthday) as $md) {
-                if (intval(trim($md)) === $current_monthday) {
-                    $include_event = true;
-                    break;
+        while ($cursor <= $end_for_expansion && $guard++ < 2000) {
+            $year = (int) $cursor->format('Y');
+            $month = (int) $cursor->format('n');
+
+            if (empty($bymonth) || in_array($month, $bymonth, true)) {
+                $candidates = caldav_month_candidates($dtstart, $year, $month, $byday_parts, $bymonthday_parts);
+
+                // BYSETPOS kiest uit de kandidaten van deze periode, bijv. -1
+                // voor "de laatste" (donderdag van de maand).
+                if (!empty($bysetpos) && !empty($candidates)) {
+                    $picked = array();
+                    foreach ($bysetpos as $pos) {
+                        $index = ($pos > 0) ? $pos - 1 : count($candidates) + $pos;
+                        if (isset($candidates[$index])) {
+                            $picked[] = $candidates[$index];
+                        }
+                    }
+                    $candidates = $picked;
+                }
+
+                foreach ($candidates as $moment) {
+                    if (!$emit($moment)) {
+                        $stop = true;
+                        break;
+                    }
                 }
             }
-        }
 
-        if ($include_event && $current >= $pastLimit && $current <= $end_for_expansion) {
-            $occurrence_end = $dtend;
-            if ($dtend && $dtstart !== $dtend) {
-                $diff = $dtstart->diff($dtend);
-                $occurrence_end = $current->add($diff);
+            if ($stop) {
+                break;
             }
-            $expanded_events[] = array('start' => $current, 'end' => $occurrence_end);
-            $generated++;
+            $cursor = $cursor->add(new DateInterval('P' . $step . 'M'));
         }
-
-        try {
-            switch ($freq) {
-                case 'DAILY':
-                    $current = $current->add(new DateInterval('P' . $interval . 'D'));
-                    break;
-                case 'WEEKLY':
-                    $current = $current->add(new DateInterval('P' . ($interval * 7) . 'D'));
-                    break;
-                case 'MONTHLY':
-                    $current = $current->add(new DateInterval('P' . $interval . 'M'));
-                    break;
-                case 'YEARLY':
-                    $current = $current->add(new DateInterval('P' . $interval . 'Y'));
-                    break;
-                default:
-                    caldav_log_error('Unknown FREQ type', ['freq' => $freq]);
-                    return null;
-            }
-        } catch (Exception $e) {
-            caldav_log_error('Error in date interval', ['error' => $e->getMessage()]);
-            break;
-        }
+    } else {
+        caldav_log_error('Unknown FREQ type', ['freq' => $freq]);
+        return null;
     }
 
     return !empty($expanded_events) ? $expanded_events : null;
+}
+
+// "MO,WE,FR" of "2TU" / "-1FR" -> [['ord' => 0|n, 'day' => 1..7], ...]
+function caldav_parse_byday($byday) {
+    $map = array('MO' => 1, 'TU' => 2, 'WE' => 3, 'TH' => 4, 'FR' => 5, 'SA' => 6, 'SU' => 7);
+    $out = array();
+
+    foreach (explode(',', (string) $byday) as $part) {
+        $part = strtoupper(trim($part));
+        if ($part === '' || !preg_match('/^([+-]?\d+)?([A-Z]{2})$/', $part, $m)) {
+            continue;
+        }
+        if (!isset($map[$m[2]])) {
+            continue;
+        }
+        $out[] = array('ord' => ($m[1] !== '') ? intval($m[1]) : 0, 'day' => $map[$m[2]]);
+    }
+
+    return $out;
+}
+
+// "1,-1,15" -> [1, -1, 15]
+function caldav_rrule_numbers($value) {
+    $out = array();
+    foreach (explode(',', (string) $value) as $part) {
+        $part = trim($part);
+        if ($part !== '' && preg_match('/^[+-]?\d+$/', $part)) {
+            $out[] = intval($part);
+        }
+    }
+    return $out;
+}
+
+// Alle kandidaat-datums binnen één maand, op volgorde. $proto levert de tijd
+// van de oorspronkelijke afspraak.
+function caldav_month_candidates($proto, $year, $month, $byday_parts, $bymonthday_parts) {
+    $days_in_month = (int) $proto->setDate($year, $month, 1)->format('t');
+    $candidates = array();
+
+    if (!empty($byday_parts)) {
+        foreach ($byday_parts as $part) {
+            // Alle dagen in deze maand die op de gevraagde weekdag vallen.
+            $matches = array();
+            for ($day = 1; $day <= $days_in_month; $day++) {
+                $moment = $proto->setDate($year, $month, $day);
+                if ((int) $moment->format('N') === $part['day']) {
+                    $matches[] = $moment;
+                }
+            }
+
+            if ($part['ord'] > 0) {
+                if (isset($matches[$part['ord'] - 1])) {
+                    $candidates[] = $matches[$part['ord'] - 1];
+                }
+            } elseif ($part['ord'] < 0) {
+                $index = count($matches) + $part['ord'];
+                if (isset($matches[$index])) {
+                    $candidates[] = $matches[$index];
+                }
+            } else {
+                $candidates = array_merge($candidates, $matches);
+            }
+        }
+    } elseif (!empty($bymonthday_parts)) {
+        foreach ($bymonthday_parts as $number) {
+            // Negatief telt vanaf het eind: -1 is de laatste dag van de maand.
+            $day = ($number > 0) ? $number : $days_in_month + $number + 1;
+            if ($day >= 1 && $day <= $days_in_month) {
+                $candidates[] = $proto->setDate($year, $month, $day);
+            }
+        }
+    } else {
+        // Geen BY-regels: dezelfde dag van de maand als het origineel. Een
+        // reeks op de 31e slaat maanden zonder 31e over.
+        $day = (int) $proto->format('j');
+        if ($day <= $days_in_month) {
+            $candidates[] = $proto->setDate($year, $month, $day);
+        }
+    }
+
+    usort($candidates, function ($a, $b) {
+        return $a <=> $b;
+    });
+
+    return $candidates;
 }
 
 // === MAIN SHORTCODE ===
@@ -1450,7 +1714,22 @@ function caldav_parse_events($ical, $options) {
     $pastLimit = $now->sub(new DateInterval('P' . intval($options['pastdays']) . 'D'));
     $futureLimit = $now->add(new DateInterval('P' . intval($options['limitdays']) . 'D'));
 
+    // Vooraf: welke losse keren zijn apart gewijzigd? Die slaan we straks over
+    // in de reeks, anders staat die dag dubbel op de site.
+    $overrides = caldav_collect_recurrence_overrides($events_raw[1]);
+
     foreach ($events_raw[1] as $vevent) {
+        // Een VEVENT kan VALARM-blokken bevatten met hun eigen DESCRIPTION,
+        // SUMMARY en DURATION. Die zouden hieronder als eigenschap van het
+        // event worden opgepikt (een herinnering van PT15M zou dan de eindtijd
+        // bepalen), dus knippen we ze er eerst uit.
+        $vevent = preg_replace('/BEGIN:VALARM.*?END:VALARM/s', '', $vevent);
+
+        // Een geannuleerde afspraak hoort niet op de site.
+        if (preg_match('/^STATUS:CANCELLED/mi', $vevent)) {
+            continue;
+        }
+
         $summary = '';
         if (preg_match('/SUMMARY:(.*?)(\r\n|$)/s', $vevent, $m)) {
             $summary = trim($m[1]);
@@ -1520,7 +1799,17 @@ function caldav_parse_events($ical, $options) {
 
         $is_all_day = preg_match('/^\d{8}$/', $start_raw);
 
-        $recurring_dates = caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options);
+        // Datums die uit de reeks moeten vallen: expliciet geschrapte keren
+        // (EXDATE) plus keren die als los gewijzigd event al meekomen.
+        $excluded = caldav_collect_exdates($vevent);
+        if (preg_match('/^UID:([^\r\n]+)/m', $vevent, $uid_match)) {
+            $uid = trim($uid_match[1]);
+            if (!empty($overrides[$uid])) {
+                $excluded += $overrides[$uid];
+            }
+        }
+
+        $recurring_dates = caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options, $excluded);
 
         if ($recurring_dates !== null) {
             foreach ($recurring_dates as $occurrence) {

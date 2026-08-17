@@ -4,7 +4,7 @@ Tags: caldav, calendar, agenda, ical, events
 Requires at least: 5.0
 Tested up to: 6.7
 Requires PHP: 7.4
-Stable tag: 2.6.5
+Stable tag: 2.6.6
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -83,6 +83,25 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 4. Card-weergave met dark theme
 
 == Changelog ==
+
+= 2.6.6 =
+* Vulde je een "calendar-home"-URL in en zit daar precies één agenda in, dan corrigeert de test de URL nu zelf en slaat hem op bij de verbinding — geen kopieer- en plakwerk meer
+* De URL wordt alleen overgenomen als de gevonden agenda ook echt werkt, zodat een verbinding nooit wordt overschreven met een URL die het evenmin doet
+* Bij meerdere agenda's blijft de keuzelijst staan (met naam, aantal items en URL per agenda), want dan valt er wél iets te kiezen
+* Fix: herinneringen (VALARM) binnen een afspraak werden meegelezen als eigenschap van de afspraak zelf — een herinnering van 15 minuten kon zo de eindtijd bepalen. VALARM-blokken worden nu overgeslagen
+* Fix: wachtwoorden en namen met een aanhalingsteken of backslash raakten beschadigd bij opslaan (ontbrekende wp_unslash op formulierinvoer)
+* Beveiliging: bij het opzoeken van agenda's worden alleen adressen op dezelfde server geaccepteerd, zodat een gekaapte CalDAV-server de site geen interne of externe adressen kan laten benaderen
+* Beveiliging: inloggegevens die in een URL zijn meegegeven worden weggeschreven uit het debug-log en uit beheerdersmeldingen
+* Beveiliging: de DeepL-sleutel staat niet langer in de HTML van de instellingenpagina — laat het veld leeg om de bestaande sleutel te behouden
+* Fix: een geschrapte keer van een herhalende afspraak (EXDATE) bleef op de site staan. Zulke keren vallen nu correct weg
+* Fix: wijzig je één keer van een herhalende afspraak apart (RECURRENCE-ID), dan stond die dag dubbel op de site — de originele keer én de gewijzigde. De reeks slaat die dag nu over
+* Fix: afspraken met STATUS:CANCELLED worden niet meer getoond
+* Fix: een wekelijkse herhaling op meerdere dagen (bijv. maandag, woensdag en vrijdag) toonde alleen de eerste dag — de overige dagen ontbraken volledig
+* Fix: maandelijkse herhalingen als "de tweede dinsdag" of "de laatste vrijdag" (BYDAY=2TU, -1FR) leverden helemaal niets op; die worden nu correct berekend
+* Fix: BYSETPOS en BYMONTH worden ondersteund, en BYMONTHDAY=-1 betekent nu de laatste dag van de maand
+* Fix: bij een reeks met een vast aantal keren (COUNT) werden de keren buiten het getoonde venster niet meegeteld, waardoor er te veel afspraken verschenen
+* Fix: een maandelijkse reeks op de 29e, 30e of 31e slaat maanden zonder die dag nu over in plaats van door te schuiven
+* Hiermee komt de weergave overeen met de agenda zoals je die in je eigen agendaprogramma ziet
 
 = 2.6.5 =
 * Fix: eindtijden verdwenen bij servers die `DURATION` schrijven in plaats van `DTEND` (o.a. Stalwart). De duur wordt nu omgerekend naar een eindtijd (PT2H30M, P1DT2H, P2W enz.)
