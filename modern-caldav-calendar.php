@@ -2,7 +2,7 @@
 /*
 Plugin Name: Modern CalDAV Calendar
 Plugin URI: https://github.com/Bolt-Connect/modern-caldav-calendar
-Description: Moderne CalDAV kalender plugin met styling, herhalingen en veiligheid. Credentials beheerd via admin-instellingen. Optionele meertaligheid via DeepL.
+Description: Moderne CalDAV kalender plugin met styling, herhalingen en veiligheid. Credentials beheerd via admin-instellingen. Optionele meertaligheid via DeepL of Google Translate.
 Version: 2.7.0
 Author: Bolt Connect
 Update URI: https://github.com/Bolt-Connect/modern-caldav-calendar
@@ -46,6 +46,8 @@ function caldav_plugin_activate() {
     add_option('caldav_cache_duration', 300);
     add_option('caldav_connections', []);
     add_option('caldav_deepl_api_key', '');
+    add_option('caldav_google_api_key', '');
+    add_option('caldav_translation_provider', 'deepl');
     add_option('caldav_show_activation_notice', true);
 }
 
@@ -315,9 +317,24 @@ function caldav_supported_languages() {
     return ['nl', 'en', 'de', 'fr', 'es'];
 }
 
-// Cache-sleutel voor één vertaalde bron-tekst.
+// Gekozen vertaaldienst: 'deepl' (standaard, zoals vóór 2.7) of 'google'.
+function caldav_translation_provider() {
+    $provider = get_option('caldav_translation_provider', 'deepl');
+    return in_array($provider, ['deepl', 'google'], true) ? $provider : 'deepl';
+}
+
+// API-sleutel van de gekozen vertaaldienst ('' als die niet is ingesteld).
+function caldav_translation_api_key($provider) {
+    return trim((string) get_option($provider === 'google' ? 'caldav_google_api_key' : 'caldav_deepl_api_key', ''));
+}
+
+// Cache-sleutel voor één vertaalde bron-tekst. Per dienst apart, zodat
+// overstappen ook echt de andere dienst laat vertalen. DeepL houdt de sleutel
+// van vóór 2.7, zodat bestaande vertalingen geldig blijven.
 function caldav_tr_cache_key($target, $is_html, $text) {
-    return 'caldav_tr_' . md5($target . '|' . ($is_html ? 'h|' : 't|') . $text);
+    $provider = caldav_translation_provider();
+    $prefix = $provider === 'deepl' ? '' : $provider . '|';
+    return 'caldav_tr_' . md5($prefix . $target . '|' . ($is_html ? 'h|' : 't|') . $text);
 }
 
 // Haal een eerder gecachete vertaling op (of false).
@@ -396,6 +413,64 @@ function caldav_deepl_translate_batch($texts, $target, $is_html, $api_key) {
     }
 }
 
+// Zelfde werkwijze via Google Cloud Translation (Basic, v2) met een API-key.
+// Google staat 128 teksten per verzoek toe; 40 houdt het verzoek klein.
+// format=html laat tags zoals <br> in de beschrijving staan; bij platte tekst
+// voorkomt format=text dat Google entities als &#39; teruggeeft.
+function caldav_google_translate_batch($texts, $target, $is_html, $api_key) {
+    $texts = array_values(array_unique(array_filter(array_map('trim', $texts), 'strlen')));
+    if (empty($texts)) {
+        return;
+    }
+
+    foreach (array_chunk($texts, 40) as $chunk) {
+        $response = wp_remote_post('https://translation.googleapis.com/language/translate/v2', [
+            'timeout' => 8,
+            'headers' => [
+                'Content-Type'   => 'application/json',
+                // Sleutel in een header in plaats van in de URL, zodat hij
+                // niet in logbestanden van proxy's terechtkomt.
+                'X-Goog-Api-Key' => $api_key,
+            ],
+            'body' => wp_json_encode([
+                'q'      => $chunk,
+                'source' => 'nl',
+                'target' => strtolower($target),
+                'format' => $is_html ? 'html' : 'text',
+            ]),
+        ]);
+
+        if (is_wp_error($response)) {
+            caldav_log_error('Google Translate request failed', ['error' => $response->get_error_message()]);
+            set_transient('caldav_tr_cooldown_google', 1, 2 * MINUTE_IN_SECONDS);
+            return;
+        }
+
+        $code = (int) wp_remote_retrieve_response_code($response);
+        if ($code === 429 || $code === 403 || $code === 400) {
+            // Te veel verzoeken, quota op (403) of een ongeldige sleutel (400)
+            // → langer terugtrekken.
+            caldav_log_error('Google Translate rate/quota/key error', ['code' => $code]);
+            set_transient('caldav_tr_cooldown_google', 1, 5 * MINUTE_IN_SECONDS);
+            return;
+        }
+        if ($code !== 200) {
+            caldav_log_error('Google Translate HTTP error', ['code' => $code]);
+            set_transient('caldav_tr_cooldown_google', 1, 2 * MINUTE_IN_SECONDS);
+            return;
+        }
+
+        $data = json_decode(wp_remote_retrieve_body($response), true);
+        $translations = $data['data']['translations'] ?? [];
+        foreach ($chunk as $i => $src) {
+            $translated = $translations[$i]['translatedText'] ?? null;
+            if ($translated !== null && $translated !== '') {
+                set_transient(caldav_tr_cache_key($target, $is_html, $src), $translated, 30 * DAY_IN_SECONDS);
+            }
+        }
+    }
+}
+
 // Vertaal titel + beschrijving van de zichtbare events (tot 'count').
 // Werkwijze: eerst de cache vullen voor alle nog-onvertaalde unieke teksten
 // (gebatcht, max 2 DeepL-verzoeken per render), daarna uit de cache toepassen.
@@ -408,7 +483,10 @@ function caldav_translate_events($events, $options, &$incomplete = false) {
         return $events;
     }
 
-    $api_key = trim(get_option('caldav_deepl_api_key', ''));
+    $provider = caldav_translation_provider();
+    $api_key = caldav_translation_api_key($provider);
+    $batch = $provider === 'google' ? 'caldav_google_translate_batch' : 'caldav_deepl_translate_batch';
+    $cooldown = $provider === 'google' ? 'caldav_tr_cooldown_google' : 'caldav_tr_cooldown';
     if (empty($api_key)) {
         $incomplete = true; // geen key → niets vertaald, blijft Nederlands
         return $events;
@@ -435,12 +513,12 @@ function caldav_translate_events($events, $options, &$incomplete = false) {
     }
 
     // 2. Vul de cache (tenzij we net een rate-limit raakten → cooldown actief).
-    if ((!empty($need_titles) || !empty($need_descs)) && !get_transient('caldav_tr_cooldown')) {
+    if ((!empty($need_titles) || !empty($need_descs)) && !get_transient($cooldown)) {
         if (!empty($need_titles)) {
-            caldav_deepl_translate_batch(array_keys($need_titles), $target, false, $api_key);
+            $batch(array_keys($need_titles), $target, false, $api_key);
         }
         if (!empty($need_descs)) {
-            caldav_deepl_translate_batch(array_keys($need_descs), $target, true, $api_key);
+            $batch(array_keys($need_descs), $target, true, $api_key);
         }
     }
 
@@ -499,36 +577,82 @@ function caldav_admin_page() {
 
     caldav_handle_admin_actions();
 
-    $allowed_tabs = ['connections', 'settings', 'help'];
-    $active_tab = isset($_GET['tab']) && in_array($_GET['tab'], $allowed_tabs) ? $_GET['tab'] : 'connections';
+    $tabs = [
+        'connections' => 'Verbindingen',
+        'settings'    => 'Instellingen',
+        'help'        => 'Hulp',
+        'about'       => 'Over',
+    ];
+    $active_tab = (isset($_GET['tab']) && isset($tabs[$_GET['tab']])) ? $_GET['tab'] : 'connections';
     $base_url = admin_url('options-general.php?page=caldav-calendar');
+
+    // Alleen uit de cache: het openen van de pagina wacht nooit op GitHub.
+    $cached_release = get_site_transient('caldav_github_release');
+    $update_version = (is_array($cached_release) && !empty($cached_release['version'])
+        && version_compare($cached_release['version'], CALDAV_PLUGIN_VERSION, '>')) ? $cached_release['version'] : '';
     ?>
-    <div class="wrap">
-        <h1>CalDAV Calendar <span style="font-size:0.6em;color:#666;">v<?php echo esc_html(CALDAV_PLUGIN_VERSION); ?></span></h1>
+    <div class="wrap caldav-wrap">
+        <header class="caldav-header">
+            <div class="caldav-header__left">
+                <img src="<?php echo esc_url(CALDAV_PLUGIN_URL . 'admin/icon.svg?ver=' . CALDAV_PLUGIN_VERSION); ?>" alt="" aria-hidden="true" class="caldav-header__icon" width="32" height="32">
+                <h1 class="caldav-header__title">CalDAV Calendar</h1>
+                <span class="caldav-header__version">v<?php echo esc_html(CALDAV_PLUGIN_VERSION); ?></span>
+                <?php if ($update_version !== ''): ?>
+                    <a class="caldav-header__update" href="<?php echo esc_url($base_url . '&tab=about'); ?>"><?php echo esc_html($update_version); ?> beschikbaar</a>
+                <?php endif; ?>
+            </div>
+            <nav class="caldav-header__nav" aria-label="CalDAV Calendar">
+                <?php foreach ($tabs as $slug => $label): ?>
+                    <a href="<?php echo esc_url($base_url . '&tab=' . $slug); ?>"
+                       class="caldav-header__link<?php echo $slug === $active_tab ? ' caldav-header__link--active' : ''; ?>"
+                       <?php echo $slug === $active_tab ? 'aria-current="page"' : ''; ?>><?php echo esc_html($label); ?></a>
+                <?php endforeach; ?>
+            </nav>
+        </header>
+        <hr class="wp-header-end">
 
-        <h2 class="nav-tab-wrapper">
-            <a href="<?php echo esc_url($base_url . '&tab=connections'); ?>" class="nav-tab <?php echo $active_tab === 'connections' ? 'nav-tab-active' : ''; ?>">Verbindingen</a>
-            <a href="<?php echo esc_url($base_url . '&tab=settings'); ?>" class="nav-tab <?php echo $active_tab === 'settings' ? 'nav-tab-active' : ''; ?>">Instellingen</a>
-            <a href="<?php echo esc_url($base_url . '&tab=help'); ?>" class="nav-tab <?php echo $active_tab === 'help' ? 'nav-tab-active' : ''; ?>">Hulp</a>
-        </h2>
-
-        <?php
-        switch ($active_tab) {
-            case 'settings':
-                caldav_render_settings_tab();
-                break;
-            case 'help':
-                caldav_render_help_tab();
-                break;
-            case 'connections':
-            default:
-                caldav_render_connections_tab();
-                break;
-        }
-        ?>
+        <div class="caldav-content">
+            <?php
+            switch ($active_tab) {
+                case 'settings':
+                    caldav_render_settings_tab();
+                    break;
+                case 'help':
+                    caldav_render_help_tab();
+                    break;
+                case 'about':
+                    caldav_render_about_tab();
+                    break;
+                case 'connections':
+                default:
+                    caldav_render_connections_tab();
+                    break;
+            }
+            ?>
+        </div>
     </div>
     <?php
 }
+
+// Beheer-CSS alleen op de eigen instellingenpagina.
+function caldav_admin_enqueue($hook) {
+    if ($hook !== 'settings_page_caldav-calendar') {
+        return;
+    }
+    wp_enqueue_style('caldav-admin', CALDAV_PLUGIN_URL . 'admin/admin.css', [], CALDAV_PLUGIN_VERSION);
+}
+add_action('admin_enqueue_scripts', 'caldav_admin_enqueue');
+
+// Snelkoppelingen in de pluginlijst.
+function caldav_plugin_action_links($links) {
+    $base = admin_url('options-general.php?page=caldav-calendar');
+    array_unshift($links,
+        '<a href="' . esc_url($base) . '">Instellingen</a>',
+        '<a href="' . esc_url($base . '&tab=about') . '">Over</a>'
+    );
+    return $links;
+}
+add_filter('plugin_action_links_' . plugin_basename(__FILE__), 'caldav_plugin_action_links');
 
 // WordPress voegt slashes toe aan $_POST. Zonder wp_unslash() raakt een
 // wachtwoord met een aanhalingsteken of backslash beschadigd bij opslaan.
@@ -547,14 +671,20 @@ function caldav_handle_admin_actions() {
     if ($action === 'update_settings' && caldav_verify_nonce('caldav_update_settings')) {
         $cache_enabled = isset($_POST['cache_enabled']);
         $cache_duration = max(60, min(3600, intval(caldav_post_value('cache_duration') ?: 300)));
-        $deepl_key = sanitize_text_field(caldav_post_value('deepl_api_key'));
         update_option('caldav_cache_enabled', $cache_enabled);
         update_option('caldav_cache_duration', $cache_duration);
+
+        $provider = sanitize_key(caldav_post_value('translation_provider'));
+        update_option('caldav_translation_provider', in_array($provider, ['deepl', 'google'], true) ? $provider : 'deepl');
+
         // Leeg laten betekent: huidige sleutel behouden (het veld toont hem niet).
-        if (isset($_POST['deepl_api_key_remove'])) {
-            update_option('caldav_deepl_api_key', '');
-        } elseif ($deepl_key !== '') {
-            update_option('caldav_deepl_api_key', $deepl_key);
+        foreach (['deepl', 'google'] as $service) {
+            $key = sanitize_text_field(caldav_post_value($service . '_api_key'));
+            if (isset($_POST[$service . '_api_key_remove'])) {
+                update_option('caldav_' . $service . '_api_key', '');
+            } elseif ($key !== '') {
+                update_option('caldav_' . $service . '_api_key', $key);
+            }
         }
         add_settings_error('caldav', 'saved', 'Instellingen opgeslagen.', 'updated');
     }
@@ -869,60 +999,64 @@ function caldav_render_connections_tab() {
         $connection = $editing_slug ? caldav_get_connection($editing_slug) : null;
         $form_title = $editing_slug ? 'Verbinding bewerken' : 'Nieuwe verbinding';
         ?>
-        <h2><?php echo esc_html($form_title); ?></h2>
-        <form method="post">
-            <?php wp_nonce_field('caldav_save_connection', 'caldav_nonce'); ?>
-            <input type="hidden" name="caldav_action" value="save_connection">
-            <input type="hidden" name="original_slug" value="<?php echo esc_attr($editing_slug); ?>">
+        <div class="caldav-card">
+            <span class="caldav-eyebrow">Verbindingen</span>
+            <h2><?php echo esc_html($form_title); ?></h2>
+            <form method="post">
+                <?php wp_nonce_field('caldav_save_connection', 'caldav_nonce'); ?>
+                <input type="hidden" name="caldav_action" value="save_connection">
+                <input type="hidden" name="original_slug" value="<?php echo esc_attr($editing_slug); ?>">
 
-            <table class="form-table">
-                <tr>
-                    <th scope="row"><label for="caldav-name">Naam</label></th>
-                    <td>
-                        <input id="caldav-name" type="text" name="name" class="regular-text" required
-                               value="<?php echo esc_attr($connection['name'] ?? ''); ?>">
-                        <p class="description">Vrije omschrijving voor in het admin-overzicht.</p>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="caldav-slug">Slug</label></th>
-                    <td>
-                        <input id="caldav-slug" type="text" name="slug" class="regular-text" required
-                               pattern="[a-z0-9-]+"
-                               value="<?php echo esc_attr($editing_slug); ?>">
-                        <p class="description">Technische ID, alleen kleine letters, cijfers en streepjes. Gebruikt in de shortcode: <code>connection="slug"</code>.</p>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="caldav-url">CalDAV URL</label></th>
-                    <td>
-                        <input id="caldav-url" type="url" name="url" class="regular-text code" required
-                               value="<?php echo esc_attr($connection['url'] ?? ''); ?>">
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="caldav-user">Gebruikersnaam</label></th>
-                    <td>
-                        <input id="caldav-user" type="text" name="user" class="regular-text" autocomplete="off"
-                               value="<?php echo esc_attr($connection['user'] ?? ''); ?>">
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="caldav-pass">Wachtwoord</label></th>
-                    <td>
-                        <input id="caldav-pass" type="password" name="pass" class="regular-text" autocomplete="new-password">
-                        <?php if ($editing_slug): ?>
-                            <p class="description">Laat leeg om het huidige wachtwoord te behouden.</p>
-                        <?php endif; ?>
-                    </td>
-                </tr>
-            </table>
+                <table class="form-table" role="presentation">
+                    <tr>
+                        <th scope="row"><label for="caldav-name">Naam</label></th>
+                        <td>
+                            <input id="caldav-name" type="text" name="name" class="regular-text" required
+                                   value="<?php echo esc_attr($connection['name'] ?? ''); ?>">
+                            <p class="description">Vrije omschrijving voor in het overzicht.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="caldav-slug">Slug</label></th>
+                        <td>
+                            <input id="caldav-slug" type="text" name="slug" class="regular-text" required
+                                   pattern="[a-z0-9-]+"
+                                   value="<?php echo esc_attr($editing_slug); ?>">
+                            <p class="description">Alleen kleine letters, cijfers en streepjes. Gebruikt in de shortcode: <code>connection="slug"</code>.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="caldav-url">CalDAV-URL</label></th>
+                        <td>
+                            <input id="caldav-url" type="url" name="url" class="regular-text code" required
+                                   value="<?php echo esc_attr($connection['url'] ?? ''); ?>">
+                            <p class="description">De URL van de agenda zelf. Weet je die niet zeker, vul dan de map-URL in en klik daarna op <strong>Testen</strong>: de plugin zoekt de agenda dan zelf op.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="caldav-user">Gebruikersnaam</label></th>
+                        <td>
+                            <input id="caldav-user" type="text" name="user" class="regular-text" autocomplete="off"
+                                   value="<?php echo esc_attr($connection['user'] ?? ''); ?>">
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="caldav-pass">Wachtwoord</label></th>
+                        <td>
+                            <input id="caldav-pass" type="password" name="pass" class="regular-text" autocomplete="new-password">
+                            <?php if ($editing_slug): ?>
+                                <p class="description">Laat leeg om het huidige wachtwoord te behouden.</p>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                </table>
 
-            <p class="submit">
-                <input type="submit" class="button-primary" value="Opslaan">
-                <a href="<?php echo esc_url($base_url); ?>" class="button">Annuleren</a>
-            </p>
-        </form>
+                <div class="caldav-card-footer caldav-row">
+                    <button type="submit" class="button button-primary">Opslaan</button>
+                    <a href="<?php echo esc_url($base_url); ?>" class="button">Annuleren</a>
+                </div>
+            </form>
+        </div>
         <?php
         return;
     }
@@ -930,76 +1064,108 @@ function caldav_render_connections_tab() {
     // List view
     $connections = caldav_get_connections();
     ?>
-    <h2>Verbindingen</h2>
-    <p>Beheer hier de CalDAV-verbindingen. Verwijs in je shortcode naar de slug: <code>[caldav_calendar connection="slug"]</code>.</p>
+    <div class="caldav-card">
+        <div class="caldav-card-head">
+            <div>
+                <span class="caldav-eyebrow">Verbindingen</span>
+                <h2>CalDAV-verbindingen</h2>
+                <p>Verwijs in de shortcode naar de slug: <code>[caldav_calendar connection="slug"]</code>.</p>
+            </div>
+            <a href="<?php echo esc_url($base_url . '&add=1'); ?>" class="button button-primary">Verbinding toevoegen</a>
+        </div>
 
-    <p>
-        <a href="<?php echo esc_url($base_url . '&add=1'); ?>" class="button button-primary">Verbinding toevoegen</a>
-    </p>
-
-    <?php if (empty($connections)): ?>
-        <p><em>Nog geen verbindingen aangemaakt.</em></p>
-    <?php else: ?>
-        <table class="wp-list-table widefat fixed striped">
-            <thead>
-                <tr>
-                    <th>Naam</th>
-                    <th>Slug</th>
-                    <th>URL</th>
-                    <th>Gebruiker</th>
-                    <th style="width:230px;">Status</th>
-                    <th style="width:220px;">Acties</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php foreach ($connections as $slug => $conn): ?>
-                    <?php
-                    $status = caldav_get_fetch_error($slug);
-                    $last_ok = caldav_get_lastgood_time($slug);
-                    ?>
+        <?php if (empty($connections)): ?>
+            <p class="caldav-empty">Nog geen verbindingen. Voeg er een toe om een agenda op de site te tonen.</p>
+        <?php else: ?>
+            <table class="wp-list-table widefat fixed striped caldav-connections">
+                <thead>
                     <tr>
-                        <td><?php echo esc_html($conn['name'] ?? '(naamloos)'); ?></td>
-                        <td><code><?php echo esc_html($slug); ?></code></td>
-                        <td><?php echo esc_html($conn['url'] ?? ''); ?></td>
-                        <td><?php echo esc_html($conn['user'] ?? ''); ?></td>
-                        <td>
-                            <?php if ($status): ?>
-                                <span style="color:#b32d2e;font-weight:600;">&#10007; Fout</span><br>
-                                <span style="color:#b32d2e;"><?php echo esc_html($status['message']); ?></span><br>
-                                <?php if (!empty($status['since'])): ?>
-                                    <small>Al mis sinds <?php echo esc_html(human_time_diff((int) $status['since'], time())); ?>.</small>
-                                <?php endif; ?>
-                                <?php if ($last_ok): ?>
-                                    <br><small>Toont de agenda van <?php echo esc_html(human_time_diff($last_ok, time())); ?> geleden.</small>
-                                <?php endif; ?>
-                            <?php elseif ($last_ok): ?>
-                                <span style="color:#207b3f;font-weight:600;">&#10003; OK</span><br>
-                                <small>Laatst opgehaald <?php echo esc_html(human_time_diff($last_ok, time())); ?> geleden.</small>
-                            <?php else: ?>
-                                <span style="color:#666;">Nog niet opgehaald.</span>
-                            <?php endif; ?>
-                        </td>
-                        <td>
-                            <form method="post" style="display:inline;">
-                                <?php wp_nonce_field('caldav_test_connection', 'caldav_nonce'); ?>
-                                <input type="hidden" name="caldav_action" value="test_connection">
-                                <input type="hidden" name="slug" value="<?php echo esc_attr($slug); ?>">
-                                <button type="submit" class="button">Testen</button>
-                            </form>
-                            <a href="<?php echo esc_url($base_url . '&edit=' . urlencode($slug)); ?>">Bewerken</a>
-                            |
-                            <form method="post" style="display:inline;" onsubmit="return confirm('Verbinding &quot;<?php echo esc_js($slug); ?>&quot; verwijderen?');">
-                                <?php wp_nonce_field('caldav_delete_connection', 'caldav_nonce'); ?>
-                                <input type="hidden" name="caldav_action" value="delete_connection">
-                                <input type="hidden" name="slug" value="<?php echo esc_attr($slug); ?>">
-                                <button type="submit" class="button-link" style="color:#b32d2e;">Verwijderen</button>
-                            </form>
-                        </td>
+                        <th scope="col" class="column-name">Naam</th>
+                        <th scope="col">Agenda</th>
+                        <th scope="col" class="column-status">Status</th>
+                        <th scope="col" class="column-actions">Acties</th>
                     </tr>
-                <?php endforeach; ?>
-            </tbody>
-        </table>
-    <?php endif; ?>
+                </thead>
+                <tbody>
+                    <?php foreach ($connections as $slug => $conn): ?>
+                        <?php
+                        $status = caldav_get_fetch_error($slug);
+                        $last_ok = caldav_get_lastgood_time($slug);
+                        ?>
+                        <tr>
+                            <td>
+                                <span class="caldav-connection-name"><?php echo esc_html($conn['name'] ?? '(naamloos)'); ?></span>
+                                <code><?php echo esc_html($slug); ?></code>
+                            </td>
+                            <td>
+                                <span class="caldav-url"><?php echo esc_html($conn['url'] ?? ''); ?></span>
+                                <?php if (!empty($conn['user'])): ?>
+                                    <span class="caldav-connection-meta">Gebruiker: <?php echo esc_html($conn['user']); ?></span>
+                                <?php endif; ?>
+                            </td>
+                            <td class="caldav-status">
+                                <?php if ($status): ?>
+                                    <span class="caldav-status-error">&#10007; Fout</span>
+                                    <span class="caldav-status-message"><?php echo esc_html($status['message']); ?></span>
+                                    <?php if (!empty($status['since'])): ?>
+                                        <small>Al mis sinds <?php echo esc_html(human_time_diff((int) $status['since'], time())); ?>.</small>
+                                    <?php endif; ?>
+                                    <?php if ($last_ok): ?>
+                                        <small>Toont de agenda van <?php echo esc_html(human_time_diff($last_ok, time())); ?> geleden.</small>
+                                    <?php endif; ?>
+                                <?php elseif ($last_ok): ?>
+                                    <span class="caldav-status-ok">&#10003; OK</span>
+                                    <small>Laatst opgehaald <?php echo esc_html(human_time_diff($last_ok, time())); ?> geleden.</small>
+                                <?php else: ?>
+                                    <span class="caldav-muted">Nog niet opgehaald.</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <div class="caldav-actions">
+                                    <form method="post">
+                                        <?php wp_nonce_field('caldav_test_connection', 'caldav_nonce'); ?>
+                                        <input type="hidden" name="caldav_action" value="test_connection">
+                                        <input type="hidden" name="slug" value="<?php echo esc_attr($slug); ?>">
+                                        <button type="submit" class="button button-small">Testen</button>
+                                    </form>
+                                    <a class="button button-small" href="<?php echo esc_url($base_url . '&edit=' . urlencode($slug)); ?>">Bewerken</a>
+                                    <form method="post" onsubmit="return confirm('Verbinding &quot;<?php echo esc_js($slug); ?>&quot; verwijderen?');">
+                                        <?php wp_nonce_field('caldav_delete_connection', 'caldav_nonce'); ?>
+                                        <input type="hidden" name="caldav_action" value="delete_connection">
+                                        <input type="hidden" name="slug" value="<?php echo esc_attr($slug); ?>">
+                                        <button type="submit" class="button button-small caldav-button-delete">Verwijderen</button>
+                                    </form>
+                                </div>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
+    </div>
+    <?php
+}
+
+// Eén sleutelveld (DeepL of Google). Het veld toont de sleutel nooit; leeg
+// laten behoudt de bestaande.
+function caldav_render_key_field($service, $label, $help_html) {
+    $current = get_option('caldav_' . $service . '_api_key', '');
+    $id = 'caldav-' . $service . '-key';
+    ?>
+    <tr>
+        <th scope="row"><label for="<?php echo esc_attr($id); ?>"><?php echo esc_html($label); ?></label></th>
+        <td>
+            <input id="<?php echo esc_attr($id); ?>" type="password" name="<?php echo esc_attr($service); ?>_api_key"
+                   class="regular-text" autocomplete="off" value=""
+                   placeholder="<?php echo esc_attr($current !== '' ? 'Sleutel is ingesteld — laat leeg om te behouden' : 'Nog geen sleutel ingesteld'); ?>">
+            <?php if ($current !== ''): ?>
+                <label class="caldav-inline-check">
+                    <input type="checkbox" name="<?php echo esc_attr($service); ?>_api_key_remove"> Sleutel verwijderen
+                </label>
+            <?php endif; ?>
+            <p class="description"><?php echo $help_html; ?></p>
+        </td>
+    </tr>
     <?php
 }
 
@@ -1008,147 +1174,260 @@ function caldav_render_settings_tab() {
 
     $cache_enabled = get_option('caldav_cache_enabled', true);
     $cache_duration = get_option('caldav_cache_duration', 300);
-    $deepl_key = get_option('caldav_deepl_api_key', '');
+    $provider = caldav_translation_provider();
     $tz_warning = caldav_timezone_warning();
     ?>
     <?php if ($tz_warning !== ''): ?>
         <div class="notice notice-warning inline"><p><?php echo $tz_warning; ?></p></div>
     <?php endif; ?>
-    <h2>Cache & instellingen</h2>
 
     <form method="post">
         <?php wp_nonce_field('caldav_update_settings', 'caldav_nonce'); ?>
         <input type="hidden" name="caldav_action" value="update_settings">
 
-        <table class="form-table">
+        <div class="caldav-card caldav-card--wide">
+        <span class="caldav-eyebrow">Vertalen</span>
+        <h2>Vertaaldienst</h2>
+        <p>Nodig voor automatische vertaling van titel en beschrijving bij <code>lang="en"</code>
+           (of een andere taal) in de shortcode. Zonder sleutel blijven die in het Nederlands;
+           datums en weekdagen worden altijd vertaald. Vertalingen worden 30 dagen gecachet.</p>
+
+        <table class="form-table" role="presentation">
             <tr>
-                <th scope="row"><label for="caldav-deepl-key">DeepL API-key</label></th>
+                <th scope="row">Vertaaldienst</th>
                 <td>
-                    <input id="caldav-deepl-key" type="password" name="deepl_api_key" class="regular-text"
-                           autocomplete="off" value=""
-                           placeholder="<?php echo $deepl_key !== '' ? 'Sleutel is ingesteld — laat leeg om te behouden' : 'Nog geen sleutel ingesteld'; ?>">
-                    <?php if ($deepl_key !== ''): ?>
-                        <br><label><input type="checkbox" name="deepl_api_key_remove"> Sleutel verwijderen</label>
-                    <?php endif; ?>
-                    <p class="description">
-                        Optioneel. Nodig voor automatische vertaling van titel en beschrijving
-                        bij <code>lang="en"</code> (of een andere taal) in de shortcode. Zonder key
-                        blijven titel/beschrijving in het Nederlands; alleen datums/weekdagen worden
-                        dan nog vertaald. Een gratis key (eindigt op <code>:fx</code>) werkt tot
-                        500.000 tekens/maand. Aanvragen via
-                        <a href="https://www.deepl.com/pro-api" target="_blank" rel="noopener">deepl.com/pro-api</a>.
-                        Vertalingen worden 30 dagen gecachet.
-                    </p>
+                    <fieldset>
+                        <legend class="screen-reader-text">Vertaaldienst</legend>
+                        <label class="caldav-radio">
+                            <input type="radio" name="translation_provider" value="deepl" <?php checked($provider, 'deepl'); ?>>
+                            DeepL
+                        </label>
+                        <label class="caldav-radio">
+                            <input type="radio" name="translation_provider" value="google" <?php checked($provider, 'google'); ?>>
+                            Google Cloud Translation
+                        </label>
+                    </fieldset>
+                    <p class="description">Bij overstappen worden teksten één keer opnieuw vertaald door de nieuwe dienst.</p>
                 </td>
             </tr>
+            <?php
+            caldav_render_key_field('deepl', 'DeepL API-key',
+                'Een gratis sleutel (eindigt op <code>:fx</code>) werkt tot 500.000 tekens per maand. Aanvragen via '
+                . '<a href="https://www.deepl.com/pro-api" target="_blank" rel="noopener">deepl.com/pro-api</a>.');
+            caldav_render_key_field('google', 'Google API-key',
+                'Een API-sleutel uit de Google Cloud Console met de <em>Cloud Translation API</em> ingeschakeld. '
+                . 'De eerste 500.000 tekens per maand zijn gratis. Beperk de sleutel bij voorkeur tot die ene API. '
+                . '<a href="https://console.cloud.google.com/apis/library/translate.googleapis.com" target="_blank" rel="noopener">Naar de Google Cloud Console</a>.');
+            ?>
+        </table>
+        </div>
+
+        <div class="caldav-card caldav-card--wide">
+        <span class="caldav-eyebrow">Prestaties</span>
+        <h2>Cache</h2>
+        <table class="form-table" role="presentation">
             <tr>
                 <th scope="row">Cache inschakelen</th>
                 <td>
                     <label>
                         <input type="checkbox" name="cache_enabled" <?php checked($cache_enabled); ?>>
-                        Cache kalenderdata om prestaties te verbeteren
+                        Kalenderdata cachen om de site snel te houden
                     </label>
                 </td>
             </tr>
             <tr>
-                <th scope="row"><label for="caldav-cache-duration">Cache-duur (seconden)</label></th>
+                <th scope="row"><label for="caldav-cache-duration">Cache-duur</label></th>
                 <td>
                     <input id="caldav-cache-duration" type="number" name="cache_duration" min="60" max="3600"
-                           value="<?php echo esc_attr($cache_duration); ?>">
+                           class="small-text" value="<?php echo esc_attr($cache_duration); ?>"> seconden
                     <p class="description">Tussen 60 en 3600 seconden (1 minuut tot 1 uur).</p>
                 </td>
             </tr>
         </table>
-
-        <p class="submit">
-            <input type="submit" class="button-primary" value="Instellingen opslaan">
-        </p>
+        <div class="caldav-card-footer">
+            <?php submit_button('Instellingen opslaan', 'primary', 'submit', false); ?>
+        </div>
+        </div>
     </form>
 
-    <hr>
-
-    <h2>Cache beheer</h2>
-    <form method="post">
-        <?php wp_nonce_field('caldav_clear_cache', 'caldav_nonce'); ?>
-        <input type="hidden" name="caldav_action" value="clear_cache">
-        <p>
-            <input type="submit" class="button" value="Cache legen">
-            <span class="description">Leeg alle opgeslagen kalenderdata om verse data op te halen.</span>
-        </p>
-    </form>
+    <div class="caldav-card caldav-card--wide">
+        <span class="caldav-eyebrow">Onderhoud</span>
+        <h2>Cache legen</h2>
+        <form method="post" class="caldav-row">
+            <?php wp_nonce_field('caldav_clear_cache', 'caldav_nonce'); ?>
+            <input type="hidden" name="caldav_action" value="clear_cache">
+            <button type="submit" class="button">Cache legen</button>
+            <span class="description">Haalt bij de volgende paginaweergave verse kalenderdata op.</span>
+        </form>
+    </div>
     <?php
 }
 
 function caldav_render_help_tab() {
     ?>
-    <h2>Hoe te gebruiken</h2>
-    <p>Maak eerst een verbinding aan onder het tabblad <strong>Verbindingen</strong>. Gebruik daarna de slug van die verbinding in de shortcode.</p>
-
-    <h3>Basis gebruik</h3>
-    <code>[caldav_calendar connection="mijn-agenda"]</code>
-
-    <h3>Alle beschikbare parameters</h3>
-    <table class="wp-list-table widefat fixed striped">
-        <thead>
-            <tr>
-                <th>Parameter</th>
-                <th>Beschrijving</th>
-                <th>Standaard</th>
-                <th>Opties</th>
-            </tr>
-        </thead>
-        <tbody>
-            <tr><td><code>connection</code></td><td>Slug van de verbinding (verplicht)</td><td>-</td><td>Slug uit het tabblad Verbindingen</td></tr>
-            <tr><td><code>view</code></td><td>Weergave</td><td>old</td><td>old, modern, list, card</td></tr>
-            <tr><td><code>theme</code></td><td>Kleurthema</td><td>default</td><td>default, dark, blue</td></tr>
-            <tr><td><code>count</code></td><td>Aantal evenementen</td><td>10</td><td>1-100</td></tr>
-            <tr><td><code>limitdays</code></td><td>Dagen vooruit kijken</td><td>365</td><td>1-3650</td></tr>
-            <tr><td><code>pastdays</code></td><td>Dagen terug kijken</td><td>0</td><td>0-365</td></tr>
-            <tr><td><code>nomonthheaders</code></td><td>Maandkoppen verbergen</td><td>false</td><td>true, false</td></tr>
-            <tr><td><code>show_time</code></td><td>Tijd weergeven</td><td>yes</td><td>yes, no</td></tr>
-            <tr><td><code>show_description</code></td><td>Beschrijving weergeven</td><td>yes</td><td>yes, no</td></tr>
-            <tr><td><code>lang</code></td><td>Taal van de weergave</td><td>nl</td><td>nl, en, de, fr, es</td></tr>
-            <tr><td><code>translation_notice</code></td><td>Vertaal-melding (oranje box) tonen bij niet-NL</td><td>yes</td><td>yes, no</td></tr>
-        </tbody>
-    </table>
-
-    <div style="background:#e7f4ff;border:1px solid #b8daff;padding:15px;border-radius:5px;margin-top:20px;">
-        <h4>Meertaligheid (vanaf v2.6)</h4>
-        <p>De agenda wordt altijd in het Nederlands ingevoerd. Met de <code>lang</code>-parameter
-        toon je dezelfde agenda automatisch in een andere taal:</p>
-        <ul style="list-style:disc;margin-left:20px;">
-            <li><strong>Datums en weekdagen</strong> worden altijd vertaald (gratis, geen API nodig).</li>
-            <li><strong>Titel en beschrijving</strong> worden vertaald via DeepL — vul daarvoor een
-            API-key in onder het tabblad <strong>Instellingen</strong>. Zonder key blijven titel en
-            beschrijving Nederlands.</li>
-        </ul>
-        <p>Plaats op je Engelse pagina (bijv. <code>/en</code>) simpelweg de shortcode met
-        <code>lang="en"</code>. Vertalingen worden 30 dagen gecachet, dus terugkerende diensten
-        kosten na de eerste keer niets meer.</p>
+    <div class="caldav-card">
+        <span class="caldav-eyebrow">Aan de slag</span>
+        <h2>Hoe te gebruiken</h2>
+        <p>Maak eerst een verbinding aan onder het tabblad <strong>Verbindingen</strong>. Gebruik daarna de slug van die verbinding in de shortcode:</p>
+        <code class="caldav-example">[caldav_calendar connection="mijn-agenda"]</code>
     </div>
 
-    <h3>Voorbeelden</h3>
-    <h4>Volgende evenement zonder maandkop</h4>
-    <code>[caldav_calendar connection="mijn-agenda" count="1" nomonthheaders="true"]</code>
+    <div class="caldav-card caldav-card--full">
+        <span class="caldav-eyebrow">Referentie</span>
+        <h2>Alle parameters</h2>
+        <table class="wp-list-table widefat striped caldav-params">
+            <thead>
+                <tr>
+                    <th scope="col">Parameter</th>
+                    <th scope="col">Beschrijving</th>
+                    <th scope="col">Standaard</th>
+                    <th scope="col">Opties</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td><code>connection</code></td><td>Slug van de verbinding (verplicht)</td><td>—</td><td>Slug uit het tabblad Verbindingen</td></tr>
+                <tr><td><code>view</code></td><td>Weergave</td><td>old</td><td>old, modern, list, card</td></tr>
+                <tr><td><code>theme</code></td><td>Kleurthema</td><td>default</td><td>default, dark, blue</td></tr>
+                <tr><td><code>count</code></td><td>Aantal evenementen</td><td>10</td><td>1–100</td></tr>
+                <tr><td><code>limitdays</code></td><td>Dagen vooruit kijken</td><td>365</td><td>1–3650</td></tr>
+                <tr><td><code>pastdays</code></td><td>Dagen terug kijken</td><td>0</td><td>0–365</td></tr>
+                <tr><td><code>nomonthheaders</code></td><td>Maandkoppen verbergen</td><td>false</td><td>true, false</td></tr>
+                <tr><td><code>show_time</code></td><td>Tijd weergeven</td><td>yes</td><td>yes, no</td></tr>
+                <tr><td><code>show_description</code></td><td>Beschrijving weergeven</td><td>yes</td><td>yes, no</td></tr>
+                <tr><td><code>lang</code></td><td>Taal van de weergave</td><td>nl</td><td>nl, en, de, fr, es</td></tr>
+                <tr><td><code>translation_notice</code></td><td>Vertaalmelding (oranje box) tonen bij niet-NL</td><td>yes</td><td>yes, no</td></tr>
+                <tr><td><code>htmltagmonth</code></td><td>HTML-tag voor maandkoppen</td><td>h4</td><td>h1–h6, p, div, span, strong</td></tr>
+                <tr><td><code>htmltagdate</code></td><td>HTML-tag voor datums</td><td>h5</td><td>h1–h6, p, div, span, strong</td></tr>
+            </tbody>
+        </table>
+    </div>
 
-    <h4>5 evenementen zonder maandkoppen</h4>
-    <code>[caldav_calendar connection="mijn-agenda" count="5" nomonthheaders="true"]</code>
+    <div class="caldav-card">
+        <span class="caldav-eyebrow">Meertaligheid</span>
+        <h2>Andere talen</h2>
+        <p>De agenda wordt in het Nederlands ingevoerd. Met de <code>lang</code>-parameter toon je dezelfde agenda in een andere taal:</p>
+        <ul class="ul-disc">
+            <li><strong>Datums en weekdagen</strong> worden altijd vertaald, zonder API.</li>
+            <li><strong>Titel en beschrijving</strong> worden vertaald via DeepL of Google — kies de dienst en vul een
+                sleutel in onder het tabblad <strong>Instellingen</strong>. Zonder sleutel blijven ze Nederlands.</li>
+        </ul>
+        <p>Vertalingen worden 30 dagen gecachet, dus terugkerende diensten kosten na de eerste keer niets meer.</p>
+    </div>
 
-    <h4>Moderne kaart weergave</h4>
-    <code>[caldav_calendar connection="mijn-agenda" view="card" theme="dark" count="15"]</code>
+    <div class="caldav-card">
+        <span class="caldav-eyebrow">Voorbeelden</span>
+        <h2>Veelgebruikte shortcodes</h2>
+        <dl class="caldav-examples">
+            <dt>Volgende evenement zonder maandkop</dt>
+            <dd><code class="caldav-example">[caldav_calendar connection="mijn-agenda" count="1" nomonthheaders="true"]</code></dd>
+            <dt>Vijf evenementen zonder maandkoppen</dt>
+            <dd><code class="caldav-example">[caldav_calendar connection="mijn-agenda" count="5" nomonthheaders="true"]</code></dd>
+            <dt>Kaartweergave, donker thema</dt>
+            <dd><code class="caldav-example">[caldav_calendar connection="mijn-agenda" view="card" theme="dark" count="15"]</code></dd>
+            <dt>Engelse versie (voor een /en-pagina)</dt>
+            <dd><code class="caldav-example">[caldav_calendar connection="mijn-agenda" lang="en"]</code></dd>
+            <dt>Engels, één los event zonder vertaalmelding (widget)</dt>
+            <dd><code class="caldav-example">[caldav_calendar connection="mijn-agenda" lang="en" count="1" translation_notice="no"]</code></dd>
+        </dl>
+    </div>
 
-    <h4>Engelse versie (voor /en-pagina)</h4>
-    <code>[caldav_calendar connection="mijn-agenda" lang="en"]</code>
-
-    <h4>Engels, één los event zonder vertaal-melding (widget)</h4>
-    <code>[caldav_calendar connection="mijn-agenda" lang="en" count="1" translation_notice="no"]</code>
-
-    <div style="background:#fff3cd;border:1px solid #ffeaa7;padding:15px;border-radius:5px;margin-top:20px;">
-        <h4>Beveiligingsnotitie</h4>
-        <p>Vanaf v2.5 worden credentials uitsluitend in admin-instellingen opgeslagen, niet meer in shortcodes. Dit voorkomt dat wachtwoorden in post-content/database-backups zichtbaar worden.</p>
+    <div class="caldav-card">
+        <span class="caldav-eyebrow">Beveiliging</span>
+        <h2>Inloggegevens</h2>
+        <p>Inloggegevens staan alleen in de admin-instellingen, nooit in de shortcode. Zo komen wachtwoorden niet in de inhoud van pagina's of in back-ups daarvan terecht.</p>
     </div>
     <?php
 }
+
+// Tab "Over": wat de plugin is, en een kaart met de updatestatus.
+function caldav_render_about_tab() {
+    $release = caldav_github_latest_release();
+    $has_update = $release && version_compare($release['version'], CALDAV_PLUGIN_VERSION, '>');
+    $repo_url = 'https://github.com/' . CALDAV_GITHUB_REPO;
+
+    if (!$release) {
+        $status = 'GitHub was niet bereikbaar. Probeer het straks opnieuw.';
+    } elseif ($has_update) {
+        $status = 'Versie ' . $release['version'] . ' is beschikbaar.';
+    } else {
+        $status = 'Je hebt de nieuwste versie.';
+    }
+    ?>
+    <?php if (isset($_GET['checked'])): ?>
+        <div class="notice notice-success inline is-dismissible"><p>Zojuist op GitHub gecontroleerd.</p></div>
+    <?php endif; ?>
+
+    <div class="caldav-card">
+        <span class="caldav-eyebrow">Over</span>
+        <h2>Modern CalDAV Calendar</h2>
+        <p>Toont een CalDAV-agenda op je site via een shortcode. Werkt met onder meer Nextcloud, Stalwart,
+           Baïkal, iCloud, SOGo en Radicale, met herhalende afspraken, uitzonderingen en optionele vertaling.</p>
+        <p>Inloggegevens staan in de admin-instellingen, nooit in de shortcode. Valt de CalDAV-server even weg,
+           dan toont de site de laatst bekende agenda en waarschuwt de plugin de beheerder.</p>
+        <p>Modern CalDAV Calendar wordt ontwikkeld en onderhouden door
+           <a href="https://www.boltconnect.nl" target="_blank" rel="noopener noreferrer">Bolt Connect</a>,
+           open source onder GPL v2 of later.</p>
+        <p class="caldav-row">
+            <a href="<?php echo esc_url($repo_url); ?>" target="_blank" rel="noopener noreferrer">Broncode op GitHub</a>
+            <a href="<?php echo esc_url($repo_url . '/releases'); ?>" target="_blank" rel="noopener noreferrer">Alle releases</a>
+            <a href="<?php echo esc_url($repo_url . '/issues'); ?>" target="_blank" rel="noopener noreferrer">Probleem melden</a>
+        </p>
+    </div>
+
+    <div class="caldav-card">
+        <span class="caldav-eyebrow">Updates</span>
+        <h2>Plugin-updates</h2>
+        <p>Geïnstalleerde versie: <strong><?php echo esc_html(CALDAV_PLUGIN_VERSION); ?></strong></p>
+        <p role="status" class="<?php echo $has_update ? 'caldav-status-update' : ($release ? 'caldav-status-ok' : 'caldav-muted'); ?>">
+            <?php echo esc_html($status); ?>
+        </p>
+        <p class="caldav-muted">Updates komen rechtstreeks uit de releases op GitHub. Verbindingen, instellingen en
+           vertalingen blijven bij een update bewaard. WordPress kijkt zelf twee keer per dag; automatische
+           updates volgen de keuze in de pluginlijst.</p>
+        <?php if (current_user_can('update_plugins')): ?>
+            <div class="caldav-row">
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                    <input type="hidden" name="action" value="caldav_check_updates">
+                    <?php wp_nonce_field('caldav_check_updates'); ?>
+                    <button type="submit" class="button">Controleren op updates</button>
+                </form>
+                <?php if ($has_update): ?>
+                    <a class="button button-primary" href="<?php echo esc_url(admin_url('plugins.php?plugin_status=upgrade')); ?>">Naar Plugins om bij te werken</a>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
+    </div>
+
+    <?php if ($release && $release['notes'] !== ''): ?>
+        <div class="caldav-card">
+            <span class="caldav-eyebrow">Changelog</span>
+            <h2>Nieuw in <?php echo esc_html($release['version']); ?></h2>
+            <div class="caldav-notes">
+                <?php echo caldav_github_notes_html($release['notes'], $release['url']); ?>
+            </div>
+        </div>
+    <?php endif; ?>
+    <?php
+}
+
+// "Controleren op updates": haal de release direct op GitHub op, laat
+// WordPress zijn updatelijst opnieuw opbouwen en ga terug naar de Over-tab.
+function caldav_admin_check_updates() {
+    if (!current_user_can('update_plugins')) {
+        wp_die('Je hebt niet voldoende rechten om op updates te controleren.');
+    }
+    check_admin_referer('caldav_check_updates');
+
+    caldav_github_latest_release(true);
+    if (function_exists('wp_clean_plugins_cache')) {
+        wp_clean_plugins_cache();
+    }
+    wp_update_plugins();
+
+    wp_safe_redirect(admin_url('options-general.php?page=caldav-calendar&tab=about&checked=1'));
+    exit;
+}
+add_action('admin_post_caldav_check_updates', 'caldav_admin_check_updates');
 
 // Reken een iCalendar DURATION (ISO 8601, bijv. PT2H30M, P1DT2H, P2W) om naar
 // een eindtijd. Retourneert null bij een onleesbare waarde, zodat de eindtijd

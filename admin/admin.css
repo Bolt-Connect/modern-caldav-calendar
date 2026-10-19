@@ -1,0 +1,480 @@
+/*
+ * Modern CalDAV Calendar - beheerpagina.
+ *
+ * Witte kopbalk, standaard WordPress-achtergrond, witte kaarten,
+ * Bolt Connect-blauw als accent (#003399).
+ */
+
+.caldav-wrap {
+	--caldav-accent: #003399;
+	--caldav-accent-hover: #002673;
+	--caldav-green: #1f8a35;
+	--caldav-red: #b32d2e;
+	--caldav-border: #e0e0e0;
+	--caldav-ink: #1e1e1e;
+	--caldav-body: #444;
+	--caldav-muted: #666;
+	--caldav-subtle: #f6f6f7;
+	margin: 0;
+	padding: 0;
+	color: var(--caldav-body);
+}
+
+.caldav-wrap *,
+.caldav-wrap *::before,
+.caldav-wrap *::after {
+	box-sizing: border-box;
+}
+
+/* ── Kopbalk ── */
+.caldav-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+	background: #fff;
+	padding: 18px 28px;
+	margin-left: -20px;
+	border-bottom: 1px solid var(--caldav-border);
+}
+
+.caldav-header__left {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.caldav-header__icon {
+	display: block;
+	width: 32px;
+	height: 32px;
+	margin-block: -4px;
+	flex-shrink: 0;
+}
+
+.caldav-header__title {
+	font-size: 18px;
+	line-height: 1.15;
+	font-weight: 600;
+	margin: 0;
+	padding: 0;
+	color: var(--caldav-ink);
+}
+
+.caldav-header__version {
+	font-size: 12px;
+	color: #888;
+	background: #f0f0f0;
+	padding: 2px 8px;
+	border-radius: 10px;
+}
+
+.caldav-header__update {
+	font-size: 12px;
+	font-weight: 600;
+	color: #fff;
+	background: var(--caldav-accent);
+	padding: 2px 8px;
+	border-radius: 10px;
+	text-decoration: none;
+}
+
+.caldav-header__update:hover,
+.caldav-header__update:focus {
+	color: #fff;
+	background: var(--caldav-accent-hover);
+}
+
+.caldav-header__nav {
+	display: flex;
+	gap: 18px;
+	flex-wrap: wrap;
+}
+
+.caldav-header__link {
+	text-decoration: none;
+	color: #555;
+	font-size: 13px;
+	font-weight: 500;
+	transition: color 0.15s;
+}
+
+.caldav-header__link:hover,
+.caldav-header__link:focus {
+	color: var(--caldav-accent);
+	box-shadow: none;
+	outline: none;
+}
+
+.caldav-header__link:focus-visible {
+	text-decoration: underline;
+}
+
+.caldav-header__link--active {
+	color: var(--caldav-accent);
+	font-weight: 600;
+}
+
+/* ── Inhoud ── */
+.caldav-content {
+	max-width: 960px;
+	margin: 30px auto;
+	padding: 0 20px;
+}
+
+.caldav-content > .notice {
+	margin: 0 0 16px;
+}
+
+.caldav-card {
+	background: #fff;
+	border: 1px solid var(--caldav-border);
+	border-radius: 8px;
+	padding: 32px 36px;
+}
+
+.caldav-card + .caldav-card,
+.caldav-card + form,
+form + .caldav-card,
+form .caldav-card + .caldav-card {
+	margin-top: 16px;
+}
+
+.caldav-card h2 {
+	font-size: 22px;
+	font-weight: 600;
+	color: var(--caldav-ink);
+	margin: 5px 0 10px;
+	padding: 0;
+	line-height: 1.25;
+}
+
+.caldav-card h3 {
+	font-size: 14px;
+	font-weight: 600;
+	color: var(--caldav-ink);
+	margin: 22px 0 6px;
+}
+
+.caldav-card p {
+	font-size: 14px;
+	line-height: 1.7;
+	margin: 0 0 14px;
+}
+
+.caldav-card p:last-child {
+	margin-bottom: 0;
+}
+
+.caldav-card code {
+	font-size: 12.5px;
+	background: var(--caldav-subtle);
+	padding: 1px 5px;
+	border-radius: 4px;
+}
+
+.caldav-eyebrow {
+	display: block;
+	color: var(--caldav-accent);
+	font-size: 11px;
+	font-weight: 700;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+}
+
+.caldav-card-head {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+	margin-bottom: 18px;
+}
+
+.caldav-card-head p {
+	margin: 0;
+}
+
+.caldav-card-footer {
+	margin-top: 8px;
+	padding-top: 20px;
+	border-top: 1px solid var(--caldav-border);
+}
+
+/* Formuliertabellen in een kaart: labels en velden op één lijn. */
+.caldav-card .form-table {
+	margin: 0;
+}
+
+.caldav-card .form-table th {
+	width: 190px;
+	padding: 16px 20px 16px 0;
+	vertical-align: top;
+	font-weight: 600;
+	color: var(--caldav-ink);
+}
+
+.caldav-card .form-table td {
+	padding: 12px 0;
+	vertical-align: top;
+}
+
+.caldav-card .form-table td p.description {
+	margin-top: 6px;
+	font-size: 13px;
+	line-height: 1.6;
+}
+
+.caldav-card .form-table input.regular-text {
+	width: 100%;
+	max-width: 420px;
+}
+
+.caldav-radio {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	margin: 4px 20px 4px 0;
+}
+
+.caldav-inline-check {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	margin-top: 8px;
+}
+
+/* Rij met knoppen of links die netjes op één lijn staan. */
+.caldav-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px 16px;
+}
+
+.caldav-row form {
+	margin: 0;
+}
+
+/* ── Verbindingen ── */
+.caldav-connections {
+	border: 1px solid var(--caldav-border);
+	border-radius: 6px;
+	box-shadow: none;
+}
+
+.caldav-connections th,
+.caldav-connections td {
+	padding: 12px 14px;
+	vertical-align: top;
+}
+
+.caldav-connections td {
+	font-size: 13px;
+	line-height: 1.5;
+}
+
+.caldav-connections .column-name { width: 18%; }
+.caldav-connections .column-status { width: 24%; }
+.caldav-connections .column-actions { width: 230px; }
+
+.caldav-connection-name {
+	display: block;
+	font-weight: 600;
+	color: var(--caldav-ink);
+}
+
+.caldav-connection-meta {
+	display: block;
+	margin-top: 2px;
+	color: var(--caldav-muted);
+}
+
+/* Lange CalDAV-URL's mogen afbreken in plaats van de tabel op te rekken. */
+.caldav-url {
+	display: block;
+	font-family: Consolas, Monaco, monospace;
+	font-size: 12px;
+	word-break: break-all;
+	color: var(--caldav-body);
+}
+
+.caldav-actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+}
+
+.caldav-actions form {
+	margin: 0;
+}
+
+.caldav-wrap .button.caldav-button-delete {
+	color: var(--caldav-red);
+	border-color: currentColor;
+}
+
+.caldav-wrap .button.caldav-button-delete:hover,
+.caldav-wrap .button.caldav-button-delete:focus {
+	color: #fff;
+	background: var(--caldav-red);
+	border-color: var(--caldav-red);
+}
+
+.caldav-empty {
+	padding: 28px;
+	text-align: center;
+	color: var(--caldav-muted);
+	background: var(--caldav-subtle);
+	border-radius: 6px;
+}
+
+/* ── Status ── */
+.caldav-status-ok,
+.caldav-status-error {
+	font-weight: 600;
+}
+
+.caldav-status-ok { color: var(--caldav-green); }
+.caldav-status-error { color: var(--caldav-red); }
+
+.caldav-muted {
+	color: var(--caldav-muted);
+}
+
+.caldav-status small {
+	display: block;
+	color: var(--caldav-muted);
+}
+
+/* ── Hulp ── */
+.caldav-example {
+	display: block;
+	padding: 10px 12px;
+	margin: 6px 0 0;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.caldav-card code.caldav-example {
+	padding: 10px 12px;
+}
+
+.caldav-examples dt {
+	font-weight: 600;
+	color: var(--caldav-ink);
+	margin-top: 16px;
+}
+
+.caldav-examples dt:first-child {
+	margin-top: 0;
+}
+
+.caldav-examples dd {
+	margin: 0;
+}
+
+.caldav-params {
+	border: 1px solid var(--caldav-border);
+	border-radius: 6px;
+	box-shadow: none;
+}
+
+.caldav-params td,
+.caldav-params th {
+	padding: 10px 14px;
+}
+
+.caldav-params td:first-child {
+	white-space: nowrap;
+}
+
+/* ── Over ── */
+.caldav-notes ul {
+	list-style: disc;
+	margin: 0 0 14px 20px;
+}
+
+.caldav-notes li {
+	margin-bottom: 4px;
+	line-height: 1.6;
+}
+
+.caldav-notes h4 {
+	margin: 18px 0 6px;
+	font-size: 13px;
+	color: var(--caldav-ink);
+}
+
+.caldav-notes h4:first-child {
+	margin-top: 0;
+}
+
+@media (max-width: 782px) {
+	.caldav-header {
+		padding: 18px;
+		margin-left: -10px;
+		flex-direction: column;
+		align-items: flex-start;
+	}
+
+	.caldav-content {
+		padding: 0;
+	}
+
+	.caldav-card {
+		padding: 24px 20px;
+	}
+
+	.caldav-card .form-table th {
+		width: auto;
+		padding-bottom: 0;
+	}
+
+	.caldav-card-head {
+		flex-direction: column;
+	}
+
+	.caldav-connections .column-name,
+	.caldav-connections .column-status,
+	.caldav-connections .column-actions {
+		width: auto;
+	}
+}
+
+/* Statuscel: elke regel op een eigen lijn. */
+.caldav-status > span {
+	display: block;
+}
+
+.caldav-status-message {
+	color: var(--caldav-red);
+}
+
+/* WordPress verplaatst meldingen naar direct onder de kopbalk. */
+.caldav-wrap > .notice,
+.caldav-wrap > .error,
+.caldav-wrap > .updated {
+	max-width: 960px;
+	margin: 20px auto 0;
+}
+
+/* WordPress' eigen .wrap h1 en fieldset-labels winnen anders. */
+.caldav-wrap .caldav-header .caldav-header__title {
+	font-size: 18px;
+	font-weight: 600;
+	line-height: 1.15;
+	padding: 0;
+	margin: 0;
+}
+
+/* forms.css zet hier margin met !important. */
+.caldav-card .form-table td fieldset label.caldav-radio {
+	margin: 4px 28px 4px 0 !important;
+}
+
+/* Een beschikbare update is geen fout: accentkleur in plaats van rood. */
+.caldav-status-update {
+	font-weight: 600;
+	color: var(--caldav-accent);
+}

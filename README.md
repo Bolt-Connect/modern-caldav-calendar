@@ -15,7 +15,7 @@ zodat ze niet in post-content of database-back-ups terechtkomen.
   (`RECURRENCE-ID`) en `STATUS:CANCELLED`
 - Zowel `DTEND` als `DURATION` voor de eindtijd
 - Nederlandse lokalisatie, plus optionele vertaling van titel en beschrijving
-  via DeepL (`lang="en"` en verder)
+  via DeepL of Google Cloud Translation (`lang="en"` en verder)
 - Meerdere verbindingen, met een **Testen**-knop die een echte CalDAV-aanroep
   doet en meldt of de URL werkt
 - Waarschuwt in wp-admin zodra een agenda op de terugval draait, zodat een

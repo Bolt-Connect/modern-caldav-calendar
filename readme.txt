@@ -21,7 +21,7 @@ Modern CalDAV Calendar haalt evenementen op uit een CalDAV-server (zoals Nextclo
 * Ondersteuning voor recurring events (RRULE) — dagelijks, wekelijks, maandelijks, jaarlijks
 * RRULE-filters: BYDAY, BYMONTHDAY, INTERVAL, COUNT, UNTIL
 * Nederlandse lokalisatie: weekdagen en maanden in het Nederlands
-* Meertaligheid via `lang`-parameter: datums/weekdagen automatisch vertaald, titel/beschrijving via DeepL
+* Meertaligheid via `lang`-parameter: datums/weekdagen automatisch vertaald, titel/beschrijving via DeepL of Google Cloud Translation
 * Configureerbare caching (60-3600 seconden)
 * Meerdere CalDAV-verbindingen beheerbaar via admin
 * Rate limiting tegen misbruik
@@ -85,6 +85,8 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 == Changelog ==
 
 = 2.7.0 =
+* Nieuw: vertalen via Google Cloud Translation naast DeepL. Kies de dienst onder Instellingen; elke dienst heeft een eigen cache, en bestaande DeepL-vertalingen blijven geldig
+* Nieuw: vernieuwde beheerpagina met kopbalk en kaarten, en een tab Over met de updatestatus en een knop "Controleren op updates". In de pluginlijst staan snelkoppelingen naar Instellingen en Over
 * Nieuw: updates via GitHub. Nieuwe versies verschijnen gewoon onder Dashboard > Updates, met de release notes onder "Details bekijken" (werkt vanaf WordPress 5.8)
 * Tijdzones: tijden worden gelezen in de zone van het event (TZID, ook Windows-namen van Outlook/Exchange) en getoond in de tijdzone van de site. Herhalingen houden hun kloktijd bij de overgang naar zomer- of wintertijd. Staat de site op een vaste afwijking als UTC+0, dan waarschuwt de plugin
 * Fix: hele-dag-afspraken met DTSTART;VALUE=DATE (iCloud, Google, Nextcloud) vielen volledig weg
@@ -102,7 +104,7 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 * Fix: maand- en dagnamen in de weergaven modern, list en card stonden altijd in het Engels, en bij lang="de", "fr" en "es" overal in het Engels
 * Beveiliging: htmltagmonth en htmltagdate accepteren alleen nog koppen en een paar tekst-tags. Voorheen kon elke auteur via de shortcode een willekeurige tag (iframe, textarea, ...) op de pagina zetten
 * Beveiliging: CalDAV-URL's en redirects zijn beperkt tot http en https
-* De DeepL-sleutel kan nu ook worden verwijderd
+* API-sleutels voor vertalen kunnen nu ook worden verwijderd
 * De activatiemelding is alleen nog zichtbaar voor beheerders
 * Na een update wordt de cache automatisch geleegd
 
