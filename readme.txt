@@ -4,7 +4,7 @@ Tags: caldav, calendar, agenda, ical, events
 Requires at least: 5.0
 Tested up to: 6.7
 Requires PHP: 7.4
-Stable tag: 2.6.6
+Stable tag: 2.7.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -83,6 +83,28 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 4. Card-weergave met dark theme
 
 == Changelog ==
+
+= 2.7.0 =
+* Nieuw: updates via GitHub. Nieuwe versies verschijnen gewoon onder Dashboard > Updates, met de release notes onder "Details bekijken" (werkt vanaf WordPress 5.8)
+* Tijdzones: tijden worden gelezen in de zone van het event (TZID, ook Windows-namen van Outlook/Exchange) en getoond in de tijdzone van de site. Herhalingen houden hun kloktijd bij de overgang naar zomer- of wintertijd. Staat de site op een vaste afwijking als UTC+0, dan waarschuwt de plugin
+* Fix: hele-dag-afspraken met DTSTART;VALUE=DATE (iCloud, Google, Nextcloud) vielen volledig weg
+* Fix: bij Nextcloud en Baïkal (servers op basis van Sabre) liepen titel, beschrijving en locatie door tot het einde van het event, omdat het XML-antwoord niet werd gedecodeerd
+* Fix: eigenschappen met parameters, zoals SUMMARY;LANGUAGE=nl (Outlook), werden niet gelezen
+* Fix: de rate limit stond vóór de cache, waardoor de elfde bezoeker binnen een minuut een foutmelding kreeg terwijl de agenda gewoon in de cache stond
+* Fix: een afspraak verdween van de site zodra hij begon; hij blijft nu staan tot hij afgelopen is. Een hele-dag-afspraak blijft de hele dag staan
+* Fix: een lege agenda werd niet gecachet, waardoor elke paginaweergave de CalDAV-server opnieuw aanriep
+* Fix: bij een storing toonde de terugval ook afspraken die intussen voorbij waren
+* Fix: een verbinding hernoemen naar een bestaande slug overschreef die andere verbinding zonder waarschuwing
+* Fix: UNTIL met alleen een datum: de laatste keer viel weg of niet, afhankelijk van het tijdstip van ophalen
+* Fix: een dagelijkse reeks met BYDAY (bijv. alleen werkdagen) negeerde BYDAY
+* Fix: een jaarlijkse reeks met BYMONTH in een andere maand dan de eerste keer, of in meerdere maanden, werd niet getoond
+* Fix: een dagelijkse reeks die lang geleden begon, verdween helemaal
+* Fix: maand- en dagnamen in de weergaven modern, list en card stonden altijd in het Engels, en bij lang="de", "fr" en "es" overal in het Engels
+* Beveiliging: htmltagmonth en htmltagdate accepteren alleen nog koppen en een paar tekst-tags. Voorheen kon elke auteur via de shortcode een willekeurige tag (iframe, textarea, ...) op de pagina zetten
+* Beveiliging: CalDAV-URL's en redirects zijn beperkt tot http en https
+* De DeepL-sleutel kan nu ook worden verwijderd
+* De activatiemelding is alleen nog zichtbaar voor beheerders
+* Na een update wordt de cache automatisch geleegd
 
 = 2.6.6 =
 * Vulde je een "calendar-home"-URL in en zit daar precies één agenda in, dan corrigeert de test de URL nu zelf en slaat hem op bij de verbinding — geen kopieer- en plakwerk meer
@@ -175,6 +197,9 @@ Ga naar Instellingen > CalDAV Calendar > Instellingen > Cache legen.
 * Initiële versie met ABSPATH-check en basisbeveiliging
 
 == Upgrade Notice ==
+
+= 2.7.0 =
+Vanaf deze versie komen updates via GitHub binnen in het dashboard. Tijden volgen nu de tijdzone van de site: controleer onder Instellingen > Algemeen dat daar een plaats staat (bijv. Amsterdam) en niet UTC+0.
 
 = 2.6.4 =
 Aanrader na 2.6.3: die versie viel bij een storing stil terug op de laatst bekende agenda, waardoor een kapotte verbinding onopgemerkt bleef. 2.6.4 waarschuwt de beheerder en voegt een testknop per verbinding toe.

@@ -24,17 +24,18 @@ zodat ze niet in post-content of database-back-ups terechtkomen.
 
 ## Installeren
 
-Bouw een zip vanaf een tag en upload die via **Plugins > Nieuwe plugin > Uploaden**:
+Download `modern-caldav-calendar-x.y.z.zip` bij de
+[nieuwste release](https://github.com/Bolt-Connect/modern-caldav-calendar/releases/latest)
+en upload die via **Plugins > Nieuwe plugin > Uploaden**. Gebruik niet de
+"Source code"-zip van GitHub: die pakt uit in een map met een andere naam.
 
-```bash
-git archive --format=zip --prefix=modern-caldav-calendar/ \
-  -o modern-caldav-calendar-2.6.6.zip v2.6.6
-```
+Daarna komen updates vanzelf binnen onder **Dashboard > Updates** (vanaf
+WordPress 5.8). De plugin kijkt hooguit twee keer per dag op GitHub;
+**Opnieuw controleren** op die pagina kijkt meteen.
 
-De `--prefix` is niet optioneel: WordPress verwacht de bestanden in een map.
-Gebruik geen `Compress-Archive` uit Windows PowerShell 5.1 — die schrijft
-backslashes als padscheiding, waarna WordPress meldt dat het pluginbestand
-niet bestaat.
+Tijden worden getoond in de tijdzone van de site. Kies onder **Instellingen >
+Algemeen** een plaats (bijv. Amsterdam) en niet een vaste afwijking als
+UTC+0, anders loopt de agenda bij zomer- en wintertijd een uur mis.
 
 ## Gebruiken
 
@@ -73,8 +74,29 @@ items. Vindt hij er precies één, dan vult hij de URL meteen correct in.
 Eén bestand, `modern-caldav-calendar.php`, zonder build-stap of dependencies.
 
 - `readme.txt` is het WordPress.org-formaat en bevat de volledige changelog
-- Versienummer staat op twee plekken: de plugin-header en `CALDAV_PLUGIN_VERSION`
-- Uitbrengen: versie ophogen, changelog bijwerken, taggen, zip bij de release
+- Versienummer staat op drie plekken: de plugin-header, `CALDAV_PLUGIN_VERSION` en `Stable tag` in `readme.txt`
+### Uitbrengen
+
+1. Versie ophogen in de plugin-header, `CALDAV_PLUGIN_VERSION` en `Stable tag`
+   in `readme.txt`; changelog bijwerken
+2. Committen, taggen en de zip bouwen vanaf de tag:
+
+   ```bash
+   git tag v2.7.0
+   git archive --format=zip --prefix=modern-caldav-calendar/ \
+     -o modern-caldav-calendar-2.7.0.zip v2.7.0
+   git push origin main v2.7.0
+   gh release create v2.7.0 modern-caldav-calendar-2.7.0.zip --title "2.7.0" --notes "..."
+   ```
+
+De updater leest de versie uit de tagnaam (`v` ervoor mag) en installeert
+de zip die bij de release hangt. Die zip moet `modern-caldav-calendar*.zip`
+heten. Drafts en prereleases worden genegeerd.
+
+De `--prefix` is niet optioneel: WordPress verwacht de bestanden in een map.
+Gebruik geen `Compress-Archive` uit Windows PowerShell 5.1 — die schrijft
+backslashes als padscheiding, waarna WordPress meldt dat het pluginbestand
+niet bestaat.
 
 ## Licentie
 

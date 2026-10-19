@@ -1,9 +1,11 @@
 <?php
 /*
 Plugin Name: Modern CalDAV Calendar
+Plugin URI: https://github.com/Bolt-Connect/modern-caldav-calendar
 Description: Moderne CalDAV kalender plugin met styling, herhalingen en veiligheid. Credentials beheerd via admin-instellingen. Optionele meertaligheid via DeepL.
-Version: 2.6.6
+Version: 2.7.0
 Author: Bolt Connect
+Update URI: https://github.com/Bolt-Connect/modern-caldav-calendar
 Requires at least: 5.0
 Tested up to: 7.0
 Requires PHP: 7.4
@@ -17,7 +19,8 @@ if (!defined('ABSPATH')) {
     exit('Direct access not permitted.');
 }
 
-define('CALDAV_PLUGIN_VERSION', '2.6.6');
+define('CALDAV_PLUGIN_VERSION', '2.7.0');
+define('CALDAV_GITHUB_REPO', 'Bolt-Connect/modern-caldav-calendar');
 define('CALDAV_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('CALDAV_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -46,6 +49,17 @@ function caldav_plugin_activate() {
     add_option('caldav_show_activation_notice', true);
 }
 
+// Een update via het dashboard roept de activatie-hook niet aan. Leeg daarom
+// bij een nieuwe versie de cache, zodat events volgens de nieuwe regels worden
+// ingelezen in plaats van tot een uur lang uit de oude cache te komen.
+function caldav_maybe_upgrade() {
+    if (get_option('caldav_plugin_version') !== CALDAV_PLUGIN_VERSION) {
+        caldav_clear_all_cache();
+        update_option('caldav_plugin_version', CALDAV_PLUGIN_VERSION);
+    }
+}
+add_action('plugins_loaded', 'caldav_maybe_upgrade');
+
 function caldav_plugin_deactivate() {
     caldav_clear_all_cache();
 }
@@ -55,6 +69,7 @@ function caldav_plugin_uninstall() {
     $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE 'caldav_%'");
     $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_caldav_%'");
     $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_caldav_%'");
+    delete_site_transient('caldav_github_release');
 }
 
 // === CONNECTIONS API ===
@@ -91,11 +106,37 @@ function caldav_sanitize_slug($slug) {
 
 function caldav_sanitize_url($url) {
     $url = str_replace('%40', '@', $url);
-    $url = sanitize_url($url);
-    if (!filter_var($url, FILTER_VALIDATE_URL)) {
+    $url = sanitize_url($url, ['http', 'https']);
+    if (!filter_var($url, FILTER_VALIDATE_URL) || !preg_match('#^https?://#i', $url)) {
         return false;
     }
     return $url;
+}
+
+// Toegestane HTML-tags voor htmltagmonth/htmltagdate. Zonder deze lijst kon
+// elke auteur via de shortcode een willekeurige tag (iframe, textarea, …) in
+// de pagina zetten.
+function caldav_sanitize_tag($tag, $default) {
+    $tag = strtolower(trim((string) $tag));
+    $allowed = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'span', 'strong'];
+    return in_array($tag, $allowed, true) ? $tag : $default;
+}
+
+// cURL-opties die beide CalDAV-aanroepen delen. Alleen http(s), ook na een
+// redirect.
+function caldav_curl_base_options($url) {
+    return [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_CONNECTTIMEOUT => 8,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+    ];
 }
 
 function caldav_get_cache_key($slug, $options = []) {
@@ -510,7 +551,9 @@ function caldav_handle_admin_actions() {
         update_option('caldav_cache_enabled', $cache_enabled);
         update_option('caldav_cache_duration', $cache_duration);
         // Leeg laten betekent: huidige sleutel behouden (het veld toont hem niet).
-        if ($deepl_key !== '') {
+        if (isset($_POST['deepl_api_key_remove'])) {
+            update_option('caldav_deepl_api_key', '');
+        } elseif ($deepl_key !== '') {
             update_option('caldav_deepl_api_key', $deepl_key);
         }
         add_settings_error('caldav', 'saved', 'Instellingen opgeslagen.', 'updated');
@@ -541,15 +584,16 @@ function caldav_handle_admin_actions() {
                 $pass = $existing['pass'] ?? '';
             }
 
-            // If slug changed during edit, remove the old entry
-            if (!empty($original_slug) && $original_slug !== $slug) {
-                caldav_delete_connection($original_slug);
-            }
-
-            // Check for collision when adding a new connection
-            if (empty($original_slug) && caldav_get_connection($slug) !== null) {
+            // Botsing controleren vóór er iets verwijderd wordt: zowel bij een
+            // nieuwe verbinding als bij het hernoemen naar een bestaande slug.
+            // Voorheen werd bij hernoemen eerst de oude verwijderd en daarna de
+            // andere verbinding stilzwijgend overschreven.
+            if ($slug !== $original_slug && caldav_get_connection($slug) !== null) {
                 add_settings_error('caldav', 'duplicate', 'Slug "' . esc_html($slug) . '" bestaat al.', 'error');
             } else {
+                if (!empty($original_slug) && $original_slug !== $slug) {
+                    caldav_delete_connection($original_slug);
+                }
                 caldav_save_connection($slug, [
                     'name' => $name,
                     'url' => $url,
@@ -593,9 +637,7 @@ function caldav_discover_calendars($url, $user, $pass) {
         return [];
     }
 
-    curl_setopt_array($ch, [
-        CURLOPT_URL => $url,
-        CURLOPT_RETURNTRANSFER => true,
+    curl_setopt_array($ch, caldav_curl_base_options($url) + [
         CURLOPT_CUSTOMREQUEST => 'PROPFIND',
         CURLOPT_POSTFIELDS => $body,
         CURLOPT_HTTPHEADER => [
@@ -603,12 +645,6 @@ function caldav_discover_calendars($url, $user, $pass) {
             'Content-Type: application/xml; charset=utf-8',
             'User-Agent: WordPress CalDAV Plugin/' . CALDAV_PLUGIN_VERSION
         ],
-        CURLOPT_TIMEOUT => 15,
-        CURLOPT_CONNECTTIMEOUT => 8,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 3,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2
     ]);
 
     if (!empty($user) || !empty($pass)) {
@@ -798,7 +834,26 @@ function caldav_test_success_message($slug, $fetch, $duration, $prefix = '') {
 
     $message .= '<br>De cache is geleegd, dus de site toont vanaf nu weer verse gegevens.';
 
+    $tz_warning = caldav_timezone_warning();
+    if ($tz_warning !== '') {
+        $message .= '<br><br>' . $tz_warning;
+    }
+
     return $message;
+}
+
+// Tijden worden getoond in de tijdzone van de site. Staat die op "UTC+0" of
+// een andere vaste afwijking in plaats van een plaats, dan loopt de agenda bij
+// zomer- en wintertijd een uur mis.
+function caldav_timezone_warning() {
+    $tz = function_exists('wp_timezone_string') ? wp_timezone_string() : '';
+    if ($tz === '' || strpos($tz, '/') !== false) {
+        return '';
+    }
+    return '<strong>Let op de tijdzone:</strong> de site staat op <code>' . esc_html($tz) . '</code>. '
+         . 'Afspraaktijden worden in die tijdzone getoond. Kies onder '
+         . '<a href="' . esc_url(admin_url('options-general.php')) . '">Instellingen &gt; Algemeen</a> '
+         . 'een plaats, bijvoorbeeld Amsterdam, zodat zomer- en wintertijd kloppen.';
 }
 
 function caldav_render_connections_tab() {
@@ -954,7 +1009,11 @@ function caldav_render_settings_tab() {
     $cache_enabled = get_option('caldav_cache_enabled', true);
     $cache_duration = get_option('caldav_cache_duration', 300);
     $deepl_key = get_option('caldav_deepl_api_key', '');
+    $tz_warning = caldav_timezone_warning();
     ?>
+    <?php if ($tz_warning !== ''): ?>
+        <div class="notice notice-warning inline"><p><?php echo $tz_warning; ?></p></div>
+    <?php endif; ?>
     <h2>Cache & instellingen</h2>
 
     <form method="post">
@@ -968,6 +1027,9 @@ function caldav_render_settings_tab() {
                     <input id="caldav-deepl-key" type="password" name="deepl_api_key" class="regular-text"
                            autocomplete="off" value=""
                            placeholder="<?php echo $deepl_key !== '' ? 'Sleutel is ingesteld — laat leeg om te behouden' : 'Nog geen sleutel ingesteld'; ?>">
+                    <?php if ($deepl_key !== ''): ?>
+                        <br><label><input type="checkbox" name="deepl_api_key_remove"> Sleutel verwijderen</label>
+                    <?php endif; ?>
                     <p class="description">
                         Optioneel. Nodig voor automatische vertaling van titel en beschrijving
                         bij <code>lang="en"</code> (of een andere taal) in de shortcode. Zonder key
@@ -1169,12 +1231,14 @@ function caldav_collect_recurrence_overrides($raw_vevents) {
 // === RECURRING EVENTS ===
 
 function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options, $excluded = []) {
-    if (!preg_match('/RRULE:(.*?)(\r\n|$)/s', $vevent, $m)) {
+    $rrule_prop = caldav_ical_prop($vevent, 'RRULE');
+    if (!$rrule_prop) {
         return null;
     }
 
-    $rrule_string = trim($m[1]);
-    $now = new DateTimeImmutable('now', new DateTimeZone(date_default_timezone_get()));
+    $rrule_string = $rrule_prop['value'];
+    $event_tz = $dtstart->getTimezone();
+    $now = new DateTimeImmutable('now', $event_tz);
     $pastLimit = $now->sub(new DateInterval('P' . intval($options['pastdays']) . 'D'));
     $futureLimit = $now->add(new DateInterval('P' . intval($options['limitdays']) . 'D'));
 
@@ -1200,14 +1264,17 @@ function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options, $ex
     if ($until) {
         $until_date = null;
         if (strlen($until) === 8) {
-            $until_date = DateTimeImmutable::createFromFormat('Ymd', $until, new DateTimeZone(date_default_timezone_get()));
-        } elseif (substr($until, -1) === 'Z') {
-            $until_date = DateTimeImmutable::createFromFormat('Ymd\THis\Z', $until, new DateTimeZone('UTC'));
+            // Alleen een datum: die dag telt nog mee, tot en met 23:59:59.
+            // Zonder '!' nam createFromFormat de huidige kloktijd over, waardoor
+            // de laatste keer afhankelijk van het tijdstip van ophalen wegviel.
+            $until_date = DateTimeImmutable::createFromFormat('!Ymd', $until, $event_tz);
             if ($until_date) {
-                $until_date = $until_date->setTimezone(new DateTimeZone(date_default_timezone_get()));
+                $until_date = $until_date->setTime(23, 59, 59);
             }
+        } elseif (strtoupper(substr($until, -1)) === 'Z') {
+            $until_date = DateTimeImmutable::createFromFormat('Ymd\THis\Z', strtoupper($until), new DateTimeZone('UTC'));
         } else {
-            $until_date = DateTimeImmutable::createFromFormat('Ymd\THis', $until, new DateTimeZone(date_default_timezone_get()));
+            $until_date = DateTimeImmutable::createFromFormat('Ymd\THis', $until, $event_tz);
         }
 
         if ($until_date) {
@@ -1246,11 +1313,13 @@ function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options, $ex
         $emitted++;
 
         $skip = !empty($excluded) && isset($excluded[$moment->format('Ymd')]);
+        $end = $duration ? $moment->add($duration) : null;
 
-        if (!$skip && $moment >= $pastLimit) {
+        // Een keer die al begonnen maar nog niet afgelopen is, blijft staan.
+        if (!$skip && ($end ?: $moment) >= $pastLimit) {
             $expanded_events[] = array(
                 'start' => $moment,
-                'end'   => $duration ? $moment->add($duration) : null,
+                'end'   => $end,
             );
         }
 
@@ -1260,7 +1329,24 @@ function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options, $ex
     $guard = 0;
 
     if ($freq === 'DAILY') {
-        for ($d = $dtstart; $d <= $end_for_expansion && $guard++ < 10000; $d = $d->add(new DateInterval('P' . $interval . 'D'))) {
+        // Zonder COUNT hoeven we niet elke dag sinds het begin af te lopen:
+        // spring naar vlak voor het venster. Anders liep een dagelijkse reeks
+        // die lang geleden begon tegen de lusgrens en verdween hij helemaal.
+        $d = $dtstart;
+        if ($count === 0 && $dtstart < $pastLimit) {
+            $skip_days = (intdiv((int) $dtstart->diff($pastLimit)->days, $interval) - 1) * $interval;
+            if ($skip_days > 0) {
+                $d = $dtstart->add(new DateInterval('P' . $skip_days . 'D'));
+            }
+        }
+
+        // BYDAY beperkt een dagelijkse reeks tot bepaalde weekdagen.
+        $days = !empty($byday_parts) ? array_column($byday_parts, 'day') : array();
+
+        for (; $d <= $end_for_expansion && $guard++ < 10000; $d = $d->add(new DateInterval('P' . $interval . 'D'))) {
+            if (!empty($days) && !in_array((int) $d->format('N'), $days, true)) {
+                continue;
+            }
             if (!$emit($d)) {
                 break;
             }
@@ -1294,14 +1380,22 @@ function caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options, $ex
             $week_start = $week_start->add(new DateInterval('P' . (7 * $interval) . 'D'));
         }
     } elseif ($freq === 'MONTHLY' || $freq === 'YEARLY') {
-        $step = ($freq === 'MONTHLY') ? $interval : $interval * 12;
+        // Een jaarlijkse reeks met BYMONTH kan in een andere maand vallen dan
+        // DTSTART, of in meerdere maanden (BYMONTH=3,10). Loop dan per maand en
+        // houd INTERVAL bij op jaarniveau; anders werd alleen de maand van
+        // DTSTART bekeken.
+        $yearly_by_month = ($freq === 'YEARLY' && !empty($bymonth));
+        $step = ($freq === 'MONTHLY') ? $interval : ($yearly_by_month ? 1 : $interval * 12);
         $cursor = $dtstart->setDate((int) $dtstart->format('Y'), (int) $dtstart->format('n'), 1);
+        $first_year = (int) $dtstart->format('Y');
 
-        while ($cursor <= $end_for_expansion && $guard++ < 2000) {
+        while ($cursor <= $end_for_expansion && $guard++ < 3000) {
             $year = (int) $cursor->format('Y');
             $month = (int) $cursor->format('n');
 
-            if (empty($bymonth) || in_array($month, $bymonth, true)) {
+            $in_period = !$yearly_by_month || (($year - $first_year) % $interval === 0);
+
+            if ($in_period && (empty($bymonth) || in_array($month, $bymonth, true))) {
                 $candidates = caldav_month_candidates($dtstart, $year, $month, $byday_parts, $bymonthday_parts);
 
                 // BYSETPOS kiest uit de kandidaten van deze periode, bijv. -1
@@ -1462,9 +1556,7 @@ function caldav_fetch_ical($url, $user, $pass) {
         return $result;
     }
 
-    curl_setopt_array($ch, [
-        CURLOPT_URL => $url,
-        CURLOPT_RETURNTRANSFER => true,
+    curl_setopt_array($ch, caldav_curl_base_options($url) + [
         CURLOPT_CUSTOMREQUEST => 'REPORT',
         CURLOPT_POSTFIELDS => $xml,
         CURLOPT_HTTPHEADER => [
@@ -1472,12 +1564,6 @@ function caldav_fetch_ical($url, $user, $pass) {
             'Content-Type: application/xml; charset=utf-8',
             'User-Agent: WordPress CalDAV Plugin/' . CALDAV_PLUGIN_VERSION
         ],
-        CURLOPT_TIMEOUT => 15,
-        CURLOPT_CONNECTTIMEOUT => 8,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 3,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2
     ]);
 
     if (!empty($user) || !empty($pass)) {
@@ -1519,14 +1605,134 @@ function caldav_fetch_ical($url, $user, $pass) {
         return $result;
     }
 
-    $ical_data = implode("\n", $matches[2]);
-
     $result['ok'] = true;
     $result['items'] = count($matches[2]);
-    // Ontvouw gevouwen iCalendar-regels (CRLF + spatie/tab, en kale LF).
-    $result['ical'] = preg_replace("/\r?\n[ \t]/", '', $ical_data);
+    $result['ical'] = implode("\n", array_map('caldav_normalize_calendar_data', $matches[2]));
 
     return $result;
+}
+
+// De iCalendar-tekst staat als XML-tekst in het antwoord. Servers op basis van
+// Sabre (Nextcloud, Baïkal) schrijven elke CR als &#13; en een & als &amp;;
+// andere servers gebruiken CDATA of kale CRLF. Zonder decoderen liepen de
+// regex-patronen voor SUMMARY e.d. door tot het einde van het event. Na deze
+// stap is elke regel afgesloten met een kale LF en zijn gevouwen regels weer
+// samengevoegd.
+function caldav_normalize_calendar_data($block) {
+    if (preg_match('/^\s*<!\[CDATA\[(.*)\]\]>\s*$/s', $block, $m)) {
+        $text = $m[1];
+    } else {
+        $text = html_entity_decode($block, ENT_QUOTES | ENT_XML1, 'UTF-8');
+    }
+    $text = str_replace(["\r\n", "\r"], "\n", $text);
+    return preg_replace("/\n[ \t]/", '', $text);
+}
+
+// === ICALENDAR-EIGENSCHAPPEN ===
+
+// Lees één eigenschap uit een VEVENT, inclusief parameters, bijv.
+// DTSTART;TZID=Europe/Amsterdam:20261020T100000 of
+// DESCRIPTION;LANGUAGE=nl-NL:... (Outlook). Retourneert
+// ['params' => ['TZID' => ...], 'value' => '...'] of null.
+function caldav_ical_prop($vevent, $name) {
+    $pattern = '/^' . preg_quote($name, '/') . '((?:;[^;:"=\n]+=(?:"[^"]*"|[^;:"\n]*))*):(.*)$/mi';
+    if (!preg_match($pattern, $vevent, $m)) {
+        return null;
+    }
+
+    $params = [];
+    if ($m[1] !== '' && preg_match_all('/;([^;:"=\n]+)=("[^"]*"|[^;:"\n]*)/', $m[1], $pm, PREG_SET_ORDER)) {
+        foreach ($pm as $p) {
+            $params[strtoupper(trim($p[1]))] = trim($p[2], '"');
+        }
+    }
+
+    return ['params' => $params, 'value' => trim($m[2])];
+}
+
+// Tekstwaarde ontsnappen volgens RFC 5545: \\ \, \; \n \N.
+function caldav_ical_unescape($value) {
+    return preg_replace_callback('/\\\\([\\\\;,nN])/', function ($m) {
+        return ($m[1] === 'n' || $m[1] === 'N') ? "\n" : $m[1];
+    }, (string) $value);
+}
+
+// === TIJDZONES ===
+//
+// Tijden worden gelezen in de zone die het event zelf opgeeft (TZID), of UTC
+// bij een Z-tijd, en daarna getoond in de tijdzone van de site (Instellingen >
+// Algemeen). Herhalingen worden in de zone van het event uitgerekend, zodat
+// een dienst van 10:00 ook na de overgang naar zomertijd om 10:00 staat.
+
+function caldav_site_timezone() {
+    return function_exists('wp_timezone') ? wp_timezone() : new DateTimeZone(date_default_timezone_get());
+}
+
+// Zet een TZID om naar een PHP-tijdzone. Ondersteunt IANA-namen (ook met
+// aanhalingstekens of een voorvoegsel zoals /freeassociation.sourceforge.net/)
+// en de Windows-namen die Exchange/Outlook gebruiken. Onbekend → null.
+function caldav_ical_timezone($tzid) {
+    $tzid = trim((string) $tzid, " \"'");
+    if ($tzid === '') {
+        return null;
+    }
+
+    $windows = [
+        'W. Europe Standard Time'       => 'Europe/Amsterdam',
+        'Romance Standard Time'         => 'Europe/Paris',
+        'Central Europe Standard Time'  => 'Europe/Budapest',
+        'Central European Standard Time'=> 'Europe/Warsaw',
+        'GMT Standard Time'             => 'Europe/London',
+        'Greenwich Standard Time'       => 'Atlantic/Reykjavik',
+        'UTC'                           => 'UTC',
+        'Coordinated Universal Time'    => 'UTC',
+    ];
+    if (isset($windows[$tzid])) {
+        $tzid = $windows[$tzid];
+    }
+
+    $candidates = [$tzid];
+    if (preg_match('#([A-Za-z_]+/[A-Za-z_\-]+(?:/[A-Za-z_\-]+)?)$#', $tzid, $m)) {
+        $candidates[] = $m[1];
+    }
+    foreach ($candidates as $name) {
+        try {
+            return new DateTimeZone($name);
+        } catch (\Exception $e) {
+            // volgende proberen
+        }
+    }
+    return null;
+}
+
+// Lees een DTSTART/DTEND-achtige eigenschap. Retourneert
+// ['dt' => DateTimeImmutable, 'all_day' => bool] of null.
+// - 20261020                 → hele dag, middernacht in de sitezone
+// - 20261020T100000Z         → UTC, omgezet naar de sitezone
+// - TZID=...:20261020T100000 → in die zone
+// - 20261020T100000          → "zwevend", in de sitezone
+function caldav_ical_datetime($prop) {
+    if (!$prop || !preg_match('/^(\d{8})(?:T(\d{4})(\d{2})?(Z)?)?$/i', $prop['value'], $m)) {
+        return null;
+    }
+
+    $site_tz = caldav_site_timezone();
+
+    if (!isset($m[2]) || $m[2] === '') {
+        $dt = DateTimeImmutable::createFromFormat('!Ymd', $m[1], $site_tz);
+        return $dt ? ['dt' => $dt, 'all_day' => true] : null;
+    }
+
+    $stamp = $m[1] . $m[2] . (isset($m[3]) && $m[3] !== '' ? $m[3] : '00');
+
+    if (!empty($m[4])) {
+        $dt = DateTimeImmutable::createFromFormat('!YmdHis', $stamp, new DateTimeZone('UTC'));
+        return $dt ? ['dt' => $dt->setTimezone($site_tz), 'all_day' => false] : null;
+    }
+
+    $tz = !empty($prop['params']['TZID']) ? caldav_ical_timezone($prop['params']['TZID']) : null;
+    $dt = DateTimeImmutable::createFromFormat('!YmdHis', $stamp, $tz ?: $site_tz);
+    return $dt ? ['dt' => $dt, 'all_day' => false] : null;
 }
 
 function caldav_calendar_shortcode($atts) {
@@ -1537,11 +1743,8 @@ function caldav_calendar_shortcode($atts) {
         $a = shortcode_atts(['connection' => ''], $atts, 'caldav_calendar');
         $slug = caldav_sanitize_slug($a['connection'] ?? '');
         caldav_record_fetch_error($slug, 'PHP-fout tijdens opbouwen kalender: ' . $e->getMessage());
-        $lastgood = caldav_get_lastgood($slug);
+        $lastgood = caldav_lastgood_for_display($slug);
         if (!empty($lastgood)) {
-            usort($lastgood, function ($x, $y) {
-                return $x['start'] <=> $y['start'];
-            });
             // Bewust in het NL renderen: geen nieuwe DeepL-calls die opnieuw
             // zouden kunnen falen.
             return caldav_generate_output($lastgood, [
@@ -1621,12 +1824,6 @@ function caldav_calendar_shortcode_impl($atts) {
     $nomonthheaders = in_array($a['nomonthheaders'], ['true', 'false']) ? $a['nomonthheaders'] : 'false';
     $translation_notice = in_array($a['translation_notice'], ['yes', 'no']) ? $a['translation_notice'] : 'yes';
 
-    // Rate limiting
-    if (!caldav_check_rate_limit($url)) {
-        caldav_log_error('Rate limit exceeded', ['url' => $url]);
-        return $err('<div class="caldav-error">Te veel verzoeken. Probeer over een minuut opnieuw.</div>');
-    }
-
     // Check cache
     $options_for_cache = [
         'count' => $count,
@@ -1642,8 +1839,8 @@ function caldav_calendar_shortcode_impl($atts) {
         'theme' => $theme,
         'show_time' => $show_time,
         'show_description' => $show_description,
-        'htmltagmonth' => sanitize_key($a['htmltagmonth']),
-        'htmltagdate' => sanitize_key($a['htmltagdate']),
+        'htmltagmonth' => caldav_sanitize_tag($a['htmltagmonth'], 'h4'),
+        'htmltagdate' => caldav_sanitize_tag($a['htmltagdate'], 'h5'),
         'date_format' => sanitize_text_field($a['date_format']),
         'nomonthheaders' => $nomonthheaders,
         'lang' => $lang,
@@ -1651,7 +1848,21 @@ function caldav_calendar_shortcode_impl($atts) {
     ];
 
     if ($cached_events !== false) {
-        return caldav_generate_output($cached_events, $clean_options);
+        return empty($cached_events)
+            ? caldav_no_events_html($lang)
+            : caldav_generate_output($cached_events, $clean_options);
+    }
+
+    // Rate limiting geldt alleen voor echte aanroepen naar de CalDAV-server.
+    // Voorheen stond dit vóór de cache, waardoor de elfde bezoeker binnen een
+    // minuut een foutmelding kreeg terwijl de agenda gewoon in de cache stond.
+    if (!caldav_check_rate_limit($url)) {
+        caldav_log_error('Rate limit exceeded', ['url' => $url]);
+        $lastgood = caldav_lastgood_for_display($slug, $pastdays);
+        if (!empty($lastgood)) {
+            return caldav_generate_output($lastgood, $clean_options);
+        }
+        return $err('<div class="caldav-error">Te veel verzoeken. Probeer over een minuut opnieuw.</div>');
     }
 
     // Terugval bij een ophaal-/serverfout: toon de laatst bekende goede agenda
@@ -1659,14 +1870,11 @@ function caldav_calendar_shortcode_impl($atts) {
     // (op niet-NL onderdrukte) foutmelding.
     // $reason wordt (beknopt, zonder credentials) vastgelegd zodat de beheerder
     // in wp-admin ziet dat de kalender op de terugval draait.
-    $fallback = function ($dutch_error_html, $reason = '') use ($slug, $clean_options, $err) {
+    $fallback = function ($dutch_error_html, $reason = '') use ($slug, $clean_options, $err, $pastdays) {
         caldav_record_fetch_error($slug, $reason !== '' ? $reason : 'Onbekende ophaalfout.');
 
-        $lastgood = caldav_get_lastgood($slug);
+        $lastgood = caldav_lastgood_for_display($slug, $pastdays);
         if (!empty($lastgood)) {
-            usort($lastgood, function ($a, $b) {
-                return $a['start'] <=> $b['start'];
-            });
             return caldav_generate_output($lastgood, $clean_options);
         }
         return $err($dutch_error_html);
@@ -1688,9 +1896,10 @@ function caldav_calendar_shortcode_impl($atts) {
 
     if (empty($events)) {
         // Ophalen slaagde wél — de agenda is simpelweg leeg binnen het venster.
+        // Ook dat cachen, anders vroeg elke paginaweergave de server opnieuw.
         caldav_clear_fetch_error($slug);
-        $no_events = $lang === 'nl' ? 'Geen komende evenementen gevonden.' : 'No upcoming events found.';
-        return '<div class="caldav-no-events">' . esc_html($no_events) . '</div>';
+        caldav_cache_events($cache_key, []);
+        return caldav_no_events_html($lang);
     }
 
     caldav_clear_fetch_error($slug);
@@ -1710,7 +1919,8 @@ function caldav_parse_events($ical, $options) {
     preg_match_all('/BEGIN:VEVENT(.*?)END:VEVENT/s', $ical, $events_raw);
     $events = array();
 
-    $now = new DateTimeImmutable('now', new DateTimeZone(date_default_timezone_get()));
+    $site_tz = caldav_site_timezone();
+    $now = new DateTimeImmutable('now', $site_tz);
     $pastLimit = $now->sub(new DateInterval('P' . intval($options['pastdays']) . 'D'));
     $futureLimit = $now->add(new DateInterval('P' . intval($options['limitdays']) . 'D'));
 
@@ -1730,74 +1940,42 @@ function caldav_parse_events($ical, $options) {
             continue;
         }
 
-        $summary = '';
-        if (preg_match('/SUMMARY:(.*?)(\r\n|$)/s', $vevent, $m)) {
-            $summary = trim($m[1]);
-            $summary = str_replace(['\,', '\;', '\n'], [',', ';', ' '], $summary);
-        }
+        // Eigenschappen kunnen parameters hebben (SUMMARY;LANGUAGE=nl:...,
+        // DTSTART;VALUE=DATE:...). Voorheen werd alleen DTSTART;TZID= herkend,
+        // waardoor hele-dag-afspraken met VALUE=DATE (iCloud, Google,
+        // Nextcloud) volledig wegvielen.
+        $prop = caldav_ical_prop($vevent, 'SUMMARY');
+        $summary = $prop ? trim(str_replace("\n", ' ', caldav_ical_unescape($prop['value']))) : '';
 
-        $description = '';
-        if (preg_match('/DESCRIPTION:(.*?)(\r\n|$)/s', $vevent, $m)) {
-            $description = trim($m[1]);
-            $description = str_replace('\n', "<br>", $description);
-            $description = str_replace(['\,', '\;'], [',', ';'], $description);
-        }
+        $prop = caldav_ical_prop($vevent, 'DESCRIPTION');
+        $description = $prop ? trim(str_replace("\n", '<br>', caldav_ical_unescape($prop['value']))) : '';
 
-        $location = '';
-        if (preg_match('/LOCATION:(.*?)(\r\n|$)/s', $vevent, $m)) {
-            $location = trim($m[1]);
-            $location = str_replace(['\,', '\;'], [',', ';'], $location);
-        }
+        $prop = caldav_ical_prop($vevent, 'LOCATION');
+        $location = $prop ? trim(str_replace("\n", ', ', caldav_ical_unescape($prop['value']))) : '';
 
-        $dtstart = null;
-        $start_raw = '';
-        if (preg_match('/DTSTART(?:;TZID=[^:]+)?:([0-9TzZ]+)(\r\n|$)/', $vevent, $m)) {
-            $start_raw = trim($m[1]);
-            if (preg_match('/^\d{8}$/', $start_raw)) {
-                $dtstart = DateTimeImmutable::createFromFormat('Ymd', $start_raw, new DateTimeZone(date_default_timezone_get()));
-            } elseif (substr($start_raw, -1) === 'Z') {
-                $dtstart = DateTimeImmutable::createFromFormat('Ymd\THis\Z', $start_raw, new DateTimeZone('UTC'));
-                if ($dtstart) {
-                    $dtstart = $dtstart->setTimezone(new DateTimeZone(date_default_timezone_get()));
-                }
-            } else {
-                $dtstart = DateTimeImmutable::createFromFormat('Ymd\THis', $start_raw, new DateTimeZone(date_default_timezone_get()));
-                if (!$dtstart) {
-                    $dtstart = DateTimeImmutable::createFromFormat('Ymd\THi', $start_raw, new DateTimeZone(date_default_timezone_get()));
-                }
-            }
-        }
-
-        $dtend = null;
-        if (preg_match('/DTEND(?:;TZID=[^:]+)?:([0-9TzZ]+)(\r\n|$)/', $vevent, $m)) {
-            $raw = trim($m[1]);
-            if (preg_match('/^\d{8}$/', $raw)) {
-                $dtend = DateTimeImmutable::createFromFormat('Ymd', $raw, new DateTimeZone(date_default_timezone_get()));
-            } elseif (substr($raw, -1) === 'Z') {
-                $dtend = DateTimeImmutable::createFromFormat('Ymd\THis\Z', $raw, new DateTimeZone('UTC'));
-                if ($dtend) {
-                    $dtend = $dtend->setTimezone(new DateTimeZone(date_default_timezone_get()));
-                }
-            } else {
-                $dtend = DateTimeImmutable::createFromFormat('Ymd\THis', $raw, new DateTimeZone(date_default_timezone_get()));
-                if (!$dtend) {
-                    $dtend = DateTimeImmutable::createFromFormat('Ymd\THi', $raw, new DateTimeZone(date_default_timezone_get()));
-                }
-            }
-        }
-
-        if (!$dtstart) {
+        $start = caldav_ical_datetime(caldav_ical_prop($vevent, 'DTSTART'));
+        if (!$start) {
             continue;
         }
+        $dtstart = $start['dt'];
+        $is_all_day = $start['all_day'];
+
+        $end = caldav_ical_datetime(caldav_ical_prop($vevent, 'DTEND'));
+        $dtend = $end ? $end['dt'] : null;
 
         // Een VEVENT mag DTEND óf DURATION hebben, nooit allebei. Diverse
         // servers (o.a. Stalwart) schrijven consequent DURATION; zonder deze
         // omrekening zou de eindtijd overal wegvallen.
-        if (!$dtend && preg_match('/DURATION:([^\r\n]+)(\r\n|$)/', $vevent, $m)) {
-            $dtend = caldav_apply_duration($dtstart, trim($m[1]));
+        $prop = caldav_ical_prop($vevent, 'DURATION');
+        if (!$dtend && $prop) {
+            $dtend = caldav_apply_duration($dtstart, $prop['value']);
         }
 
-        $is_all_day = preg_match('/^\d{8}$/', $start_raw);
+        // Een hele-dag-afspraak zonder einde duurt die ene dag. Zo blijft hij
+        // de hele dag zichtbaar in plaats van om middernacht te verdwijnen.
+        if (!$dtend && $is_all_day) {
+            $dtend = $dtstart->add(new DateInterval('P1D'));
+        }
 
         // Datums die uit de reeks moeten vallen: expliciet geschrapte keren
         // (EXDATE) plus keren die als los gewijzigd event al meekomen.
@@ -1810,38 +1988,99 @@ function caldav_parse_events($ical, $options) {
         }
 
         $recurring_dates = caldav_expand_recurring_events($vevent, $dtstart, $dtend, $options, $excluded);
+        if ($recurring_dates === null) {
+            $recurring_dates = [['start' => $dtstart, 'end' => $dtend]];
+        }
 
-        if ($recurring_dates !== null) {
-            foreach ($recurring_dates as $occurrence) {
-                if ($occurrence['start'] >= $pastLimit && $occurrence['start'] <= $futureLimit) {
-                    $events[] = array(
-                        'summary' => $summary,
-                        'description' => $description,
-                        'location' => $location,
-                        'start' => $occurrence['start'],
-                        'end' => $occurrence['end'],
-                        'is_all_day' => $is_all_day
-                    );
-                }
+        foreach ($recurring_dates as $occurrence) {
+            // Zichtbaar zolang de afspraak nog niet voorbij is (niet alleen
+            // zolang hij nog niet begonnen is).
+            $last_moment = $occurrence['end'] ?: $occurrence['start'];
+            if ($last_moment < $pastLimit || $occurrence['start'] > $futureLimit) {
+                continue;
             }
-        } else {
-            if ($dtstart >= $pastLimit && $dtstart <= $futureLimit) {
-                $events[] = array(
-                    'summary' => $summary,
-                    'description' => $description,
-                    'location' => $location,
-                    'start' => $dtstart,
-                    'end' => $dtend,
-                    'is_all_day' => $is_all_day
-                );
-            }
+            // Hele-dag-afspraken blijven op hun kalenderdag staan; tijden
+            // worden in de tijdzone van de site getoond.
+            $events[] = array(
+                'summary' => $summary,
+                'description' => $description,
+                'location' => $location,
+                'start' => $is_all_day ? $occurrence['start'] : $occurrence['start']->setTimezone($site_tz),
+                'end' => ($occurrence['end'] && !$is_all_day) ? $occurrence['end']->setTimezone($site_tz) : $occurrence['end'],
+                'is_all_day' => $is_all_day
+            );
         }
     }
 
     return $events;
 }
 
+// Laatst bekende goede agenda, zonder afspraken die intussen voorbij zijn.
+// Zonder dit filter bleef bij een langere storing een dienst van vorige week
+// bovenaan staan.
+function caldav_lastgood_for_display($slug, $pastdays = 0) {
+    $limit = (new DateTimeImmutable('now'))->sub(new DateInterval('P' . max(0, intval($pastdays)) . 'D'));
+    $events = array_values(array_filter(caldav_get_lastgood($slug), function ($event) use ($limit) {
+        if (empty($event['start']) || !($event['start'] instanceof DateTimeInterface)) {
+            return false;
+        }
+        $last = (!empty($event['end']) && $event['end'] instanceof DateTimeInterface) ? $event['end'] : $event['start'];
+        return $last >= $limit;
+    }));
+    usort($events, function ($a, $b) {
+        return $a['start'] <=> $b['start'];
+    });
+    return $events;
+}
+
+function caldav_no_events_html($lang) {
+    $no_events = $lang === 'nl' ? 'Geen komende evenementen gevonden.' : 'No upcoming events found.';
+    return '<div class="caldav-no-events">' . esc_html($no_events) . '</div>';
+}
+
 // === OUTPUT GENERATORS ===
+
+// Dag- en maandnamen per taal, los van de taal van de WordPress-installatie:
+// een Engelse pagina op een Nederlandse site moet Engelse namen tonen.
+// Index 1..12 voor maanden, 1..7 (ma..zo, ISO) voor dagen.
+function caldav_date_names($lang) {
+    static $names = null;
+    if ($names === null) {
+        $table = [
+            'nl' => ['januari februari maart april mei juni juli augustus september oktober november december',
+                     'jan feb mrt apr mei jun jul aug sep okt nov dec',
+                     'maandag dinsdag woensdag donderdag vrijdag zaterdag zondag'],
+            'en' => ['January February March April May June July August September October November December',
+                     'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec',
+                     'Monday Tuesday Wednesday Thursday Friday Saturday Sunday'],
+            'de' => ['Januar Februar März April Mai Juni Juli August September Oktober November Dezember',
+                     'Jan Feb Mär Apr Mai Jun Jul Aug Sep Okt Nov Dez',
+                     'Montag Dienstag Mittwoch Donnerstag Freitag Samstag Sonntag'],
+            'fr' => ['janvier février mars avril mai juin juillet août septembre octobre novembre décembre',
+                     'janv févr mars avr mai juin juil août sept oct nov déc',
+                     'lundi mardi mercredi jeudi vendredi samedi dimanche'],
+            'es' => ['enero febrero marzo abril mayo junio julio agosto septiembre octubre noviembre diciembre',
+                     'ene feb mar abr may jun jul ago sep oct nov dic',
+                     'lunes martes miércoles jueves viernes sábado domingo'],
+        ];
+        $names = [];
+        foreach ($table as $code => $rows) {
+            $names[$code] = [
+                'months'       => array_combine(range(1, 12), explode(' ', $rows[0])),
+                'months_short' => array_combine(range(1, 12), explode(' ', $rows[1])),
+                'days'         => array_combine(range(1, 7), explode(' ', $rows[2])),
+            ];
+        }
+    }
+    $lang = strtolower((string) $lang);
+    return $names[$lang] ?? $names['nl'];
+}
+
+// Maandkop, bijv. "Oktober 2026".
+function caldav_month_heading($date, $lang) {
+    $names = caldav_date_names($lang);
+    return ucfirst($names['months'][(int) $date->format('n')]) . ' ' . $date->format('Y');
+}
 
 // Waarschuwingsbox boven de kalender bij een andere taal dan NL: de agenda
 // wordt automatisch vertaald en kan deels Nederlands blijven (fallback).
@@ -1932,7 +2171,7 @@ function caldav_generate_modern_view($events, $options) {
                 $out .= '</div>';
             }
             $out .= '<div class="caldav-month-section">';
-            $out .= '<' . $options['htmltagmonth'] . ' class="caldav-month-header">' . esc_html($month) . '</' . $options['htmltagmonth'] . '>';
+            $out .= '<' . $options['htmltagmonth'] . ' class="caldav-month-header">' . esc_html(caldav_month_heading($event['start'], $options['lang'] ?? 'nl')) . '</' . $options['htmltagmonth'] . '>';
             $currentMonth = $month;
         } elseif ($options['nomonthheaders'] === 'true' && $currentMonth === '') {
             $out .= '<div class="caldav-month-section caldav-no-header">';
@@ -1969,7 +2208,8 @@ function caldav_generate_card_view($events, $options) {
 
 function caldav_generate_event_card($event, $options, $standalone = false) {
     $day = $event['start']->format('d');
-    $month_short = $event['start']->format('M');
+    $names = caldav_date_names($options['lang'] ?? 'nl');
+    $month_short = esc_html($names['months_short'][(int) $event['start']->format('n')]);
 
     $card_class = $standalone ? 'caldav-card-standalone' : 'caldav-event-card';
 
@@ -2013,7 +2253,7 @@ function caldav_generate_list_view($events, $options) {
 
         if ($month !== $currentMonth && $options['nomonthheaders'] !== 'true') {
             $out .= '<li class="caldav-month-divider">';
-            $out .= '<' . $options['htmltagmonth'] . '>' . esc_html($month) . '</' . $options['htmltagmonth'] . '>';
+            $out .= '<' . $options['htmltagmonth'] . '>' . esc_html(caldav_month_heading($event['start'], $options['lang'] ?? 'nl')) . '</' . $options['htmltagmonth'] . '>';
             $out .= '</li>';
             $currentMonth = $month;
         }
@@ -2043,46 +2283,17 @@ function caldav_generate_old_view($events, $options) {
     $currentMonth = '';
     $i = 0;
 
-    $months = array(
-        'January' => 'januari', 'February' => 'februari', 'March' => 'maart',
-        'April' => 'april', 'May' => 'mei', 'June' => 'juni',
-        'July' => 'juli', 'August' => 'augustus', 'September' => 'september',
-        'October' => 'oktober', 'November' => 'november', 'December' => 'december'
-    );
-
-    $days = array(
-        'Monday' => 'maandag', 'Tuesday' => 'dinsdag', 'Wednesday' => 'woensdag',
-        'Thursday' => 'donderdag', 'Friday' => 'vrijdag', 'Saturday' => 'zaterdag',
-        'Sunday' => 'zondag'
-    );
-
-    // Alleen bij NL de eigen vertaaltabel gebruiken; andere talen tonen de
-    // Engelse namen die PHP's date()-format al levert (Friday, October, …).
-    $useDutch = strtolower($options['lang'] ?? 'nl') === 'nl';
+    $names = caldav_date_names($options['lang'] ?? 'nl');
 
     foreach ($events as $event) {
         $month = $event['start']->format('F Y');
 
-        $dayName = $event['start']->format('l');
-        $dayNumber = $event['start']->format('j');
-        $monthName = $event['start']->format('F');
-
-        $dayLabel = $useDutch
-            ? (isset($days[$dayName]) ? ucfirst($days[$dayName]) : ucfirst(strtolower($dayName)))
-            : $dayName;
-        $monthLabel = $useDutch
-            ? (isset($months[$monthName]) ? $months[$monthName] : strtolower($monthName))
-            : $monthName;
-
-        $dateReadable = $dayLabel . ' ' . $dayNumber . ' ' . $monthLabel;
+        $dateReadable = ucfirst($names['days'][(int) $event['start']->format('N')]) . ' '
+                      . $event['start']->format('j') . ' '
+                      . $names['months'][(int) $event['start']->format('n')];
 
         if ($month !== $currentMonth && $options['nomonthheaders'] !== 'true') {
-            $monthOnly = $event['start']->format('F');
-            $year = $event['start']->format('Y');
-            $monthHeadLabel = $useDutch
-                ? (isset($months[$monthOnly]) ? $months[$monthOnly] : strtolower($monthOnly))
-                : $monthOnly;
-            $monthFormatted = ucfirst($monthHeadLabel) . ' ' . $year;
+            $monthFormatted = caldav_month_heading($event['start'], $options['lang'] ?? 'nl');
             $out .= '<li class="caldav-month"><' . $options['htmltagmonth'] . '>' . esc_html($monthFormatted) . '</' . $options['htmltagmonth'] . '></li>';
             $currentMonth = $month;
         }
@@ -2123,7 +2334,7 @@ add_shortcode('caldav_calendar', 'caldav_calendar_shortcode');
 // === ACTIVATION NOTICE ===
 
 function caldav_show_activation_notice() {
-    if (get_option('caldav_show_activation_notice')) {
+    if (current_user_can('manage_options') && get_option('caldav_show_activation_notice')) {
         ?>
         <div class="notice notice-success is-dismissible">
             <p><strong>Modern CalDAV Calendar v<?php echo esc_html(CALDAV_PLUGIN_VERSION); ?> geactiveerd!</strong>
@@ -2200,3 +2411,178 @@ function caldav_enqueue_styles() {
     );
 }
 add_action('wp_enqueue_scripts', 'caldav_enqueue_styles');
+
+// === UPDATES VIA GITHUB ===
+//
+// WordPress kijkt via de Update URI-header niet op wordpress.org, maar vraagt
+// het hier na. Bron is de nieuwste release op GitHub (drafts en prereleases
+// telt GitHub niet mee). Geïnstalleerd wordt de zip die bij de release hangt,
+// niet de automatische "Source code"-zip: die pakt uit in een map met een
+// commit-hash in de naam, waarna WordPress de plugin als een andere ziet.
+
+// Haalt de nieuwste release op, 12 uur gecachet. Zonder token staat GitHub
+// 60 aanroepen per uur per IP toe; een mislukte aanroep wordt een uur
+// onthouden zodat een storing niet bij elke paginaweergave opnieuw wordt
+// geprobeerd.
+function caldav_github_latest_release($force = false) {
+    $cached = get_site_transient('caldav_github_release');
+    if (!$force && is_array($cached)) {
+        return empty($cached) ? null : $cached;
+    }
+
+    $response = wp_remote_get('https://api.github.com/repos/' . CALDAV_GITHUB_REPO . '/releases/latest', [
+        'timeout' => 10,
+        'headers' => [
+            'Accept'     => 'application/vnd.github+json',
+            'User-Agent' => 'Modern-CalDAV-Calendar/' . CALDAV_PLUGIN_VERSION,
+        ],
+    ]);
+
+    $data = null;
+    if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+        $data = json_decode(wp_remote_retrieve_body($response), true);
+    }
+
+    $package = '';
+    if (is_array($data) && !empty($data['assets']) && is_array($data['assets'])) {
+        foreach ($data['assets'] as $asset) {
+            $name = isset($asset['name']) ? $asset['name'] : '';
+            if (preg_match('/^modern-caldav-calendar.*\.zip$/i', $name) && !empty($asset['browser_download_url'])) {
+                $package = $asset['browser_download_url'];
+                break;
+            }
+        }
+    }
+
+    if (!is_array($data) || empty($data['tag_name']) || $package === '') {
+        set_site_transient('caldav_github_release', [], HOUR_IN_SECONDS);
+        return null;
+    }
+
+    $release = [
+        'version'   => ltrim($data['tag_name'], 'vV'),
+        'package'   => $package,
+        'url'       => isset($data['html_url']) ? $data['html_url'] : 'https://github.com/' . CALDAV_GITHUB_REPO,
+        'notes'     => isset($data['body']) ? (string) $data['body'] : '',
+        'published' => isset($data['published_at']) ? $data['published_at'] : '',
+    ];
+    set_site_transient('caldav_github_release', $release, 12 * HOUR_IN_SECONDS);
+    return $release;
+}
+
+// "Opnieuw controleren" onder Dashboard > Updates slaat de cache over, zodat
+// een net uitgebrachte versie meteen zichtbaar is.
+function caldav_github_force_check() {
+    return !empty($_GET['force-check']) && current_user_can('update_plugins');
+}
+
+function caldav_github_update_check($update, $plugin_data, $plugin_file) {
+    if ($plugin_file !== plugin_basename(__FILE__)) {
+        return $update;
+    }
+
+    $release = caldav_github_latest_release(caldav_github_force_check());
+    if (!$release) {
+        return $update;
+    }
+
+    // WordPress vergelijkt zelf de versie en toont alleen een update als die
+    // nieuwer is dan de geïnstalleerde.
+    return [
+        'slug'         => dirname(plugin_basename(__FILE__)),
+        'version'      => $release['version'],
+        'url'          => $release['url'],
+        'package'      => $release['package'],
+        'requires_php' => '7.4',
+    ];
+}
+add_filter('update_plugins_github.com', 'caldav_github_update_check', 10, 3);
+
+// Venster "Details bekijken" bij de update: toont de release notes van GitHub.
+function caldav_github_plugin_info($result, $action, $args) {
+    if ($action !== 'plugin_information' || empty($args->slug) || $args->slug !== dirname(plugin_basename(__FILE__))) {
+        return $result;
+    }
+
+    $release = caldav_github_latest_release();
+    if (!$release) {
+        return $result;
+    }
+
+    return (object) [
+        'name'          => 'Modern CalDAV Calendar',
+        'slug'          => $args->slug,
+        'version'       => $release['version'],
+        'author'        => '<a href="https://boltconnect.nl">Bolt Connect</a>',
+        'homepage'      => 'https://github.com/' . CALDAV_GITHUB_REPO,
+        'download_link' => $release['package'],
+        'requires_php'  => '7.4',
+        'last_updated'  => $release['published'],
+        'sections'      => [
+            'changelog' => caldav_github_notes_html($release['notes'], $release['url']),
+        ],
+    ];
+}
+add_filter('plugins_api', 'caldav_github_plugin_info', 10, 3);
+
+// Release notes zijn Markdown. Alleen het nodige: opsommingen worden een
+// lijst, koppen vet, de rest losse alinea's. Alles wordt eerst ge-escaped.
+function caldav_github_notes_html($markdown, $url) {
+    $html = '';
+    $in_list = false;
+    foreach (preg_split('/\r\n|\r|\n/', $markdown) as $line) {
+        $line = trim($line);
+        $is_item = preg_match('/^[-*]\s+(.*)$/', $line, $m);
+        if ($in_list && !$is_item) {
+            $html .= '</ul>';
+            $in_list = false;
+        }
+        if ($is_item) {
+            if (!$in_list) {
+                $html .= '<ul>';
+                $in_list = true;
+            }
+            $html .= '<li>' . esc_html($m[1]) . '</li>';
+        } elseif (preg_match('/^#+\s+(.*)$/', $line, $m)) {
+            $html .= '<h4>' . esc_html($m[1]) . '</h4>';
+        } elseif ($line !== '') {
+            $html .= '<p>' . esc_html($line) . '</p>';
+        }
+    }
+    if ($in_list) {
+        $html .= '</ul>';
+    }
+    $html .= '<p><a href="' . esc_url($url) . '" target="_blank" rel="noopener">Bekijk de release op GitHub</a></p>';
+    return $html;
+}
+
+// Staat de plugin in een map met een andere naam (bijvoorbeeld na het
+// uploaden van een hernoemde zip), dan zou de update een tweede map naast de
+// oude zetten en WordPress de plugin uitschakelen. Hernoem de uitgepakte map
+// daarom naar de huidige mapnaam.
+function caldav_github_fix_source_dir($source, $remote_source, $upgrader, $hook_extra = []) {
+    global $wp_filesystem;
+
+    if (empty($hook_extra['plugin']) || $hook_extra['plugin'] !== plugin_basename(__FILE__)) {
+        return $source;
+    }
+
+    $wanted = trailingslashit($remote_source) . dirname(plugin_basename(__FILE__));
+    if (untrailingslashit($source) === $wanted) {
+        return $source;
+    }
+    if ($wp_filesystem && $wp_filesystem->move(untrailingslashit($source), $wanted, true)) {
+        return trailingslashit($wanted);
+    }
+    return new WP_Error('caldav_update_dir', 'De update kon niet in de pluginmap worden geplaatst.');
+}
+add_filter('upgrader_source_selection', 'caldav_github_fix_source_dir', 10, 4);
+
+// Na een update de cache legen, zodat de oude release niet blijft hangen.
+function caldav_github_after_upgrade($upgrader, $options) {
+    if (isset($options['action'], $options['type']) && $options['action'] === 'update' && $options['type'] === 'plugin'
+        && !empty($options['plugins']) && in_array(plugin_basename(__FILE__), (array) $options['plugins'], true)) {
+        delete_site_transient('caldav_github_release');
+    }
+}
+add_action('upgrader_process_complete', 'caldav_github_after_upgrade', 10, 2);
